@@ -191,9 +191,16 @@ background by materializing a flattened manifest; the flattened manifest is sema
 so collapsing is invisible and can be interrupted safely.
 
 **Three-way diff** (branches A, B, and their merge base) classifies every logical page as
-`Unchanged | AOnly | BOnly | Conflict`. This output type exists to be consumed by LoomDB's merge
-engine ([doc 03 §3.1](./03-agent-native-database-architecture.md#p1--branchable-state)) — it is
-designed for that consumer, not for humans.
+`Unchanged | AOnly | BOnly | BothSame | Conflict`. It is consumed by LoomDB's merge engine
+([doc 03 §3.3](./03-agent-native-database-architecture.md)) — designed for that consumer, not for
+humans.
+
+> **What this is, and what it is not.** `diff3` compares **pages**, which are a *physical* 64 KiB
+> unit. It is a **fast prefilter** — "which pages did the two branches touch" — and it must never be
+> mistaken for the merge itself. Two agents writing two unrelated facts that happen to land in the
+> same page are not in conflict, and a merge engine that says otherwise is lying. LoomDB decodes the
+> records inside the changed pages and merges at **record** granularity (doc 03 §3.3). Substrate's
+> job is to make that search cheap, not to make the decision.
 
 #### Garbage collection
 

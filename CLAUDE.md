@@ -1,8 +1,10 @@
 # CLAUDE.md — Substrate
 
 **Read this file, then [docs/02](docs/02-embedded-single-node-engine-architecture.md),
-[docs/03](docs/03-agent-native-database-architecture.md), and
-[docs/04](docs/04-flockdb-loomdb-unified-roadmap.md) before writing any code.** Those docs are the
+[docs/03](docs/03-agent-native-database-architecture.md),
+[docs/04](docs/04-flockdb-loomdb-unified-roadmap.md), and — before any LoomDB work —
+[docs/05](docs/05-loomdb-test-spec.md), which is the acceptance catalog LoomDB is judged
+against.** Those docs are the
 architecture of record. Code that contradicts them is a bug in the code, or a bug in the docs —
 resolve it in the docs first, then in code.
 
@@ -132,7 +134,8 @@ crates/
 testing/
   fuzz/                cargo-fuzz targets + crash injection
   integration/         cross-crate lifecycle tests
-docs/                  02, 03, 04 (architecture of record), substrate-api.md, threat-model.md
+docs/                  02, 03, 04 (architecture of record), 05 (LoomDB test spec),
+                       substrate-api.md, threat-model.md
 ```
 
 ## Working commands
