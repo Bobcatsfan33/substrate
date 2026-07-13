@@ -1,0 +1,11 @@
+/target
+/vendor
+**/*.rs.bk
+*.pdb
+.DS_Store
+
+# cargo-fuzz artifacts: corpora and crashes are generated, not source
+testing/fuzz/target
+testing/fuzz/corpus
+testing/fuzz/artifacts
+testing/fuzz/coverage

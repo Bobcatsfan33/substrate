@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+exclude = ["testing/fuzz"]
+members = [
+    "crates/substrate-pager",
+    "crates/substrate-wal",
+    "crates/substrate-store",
+    "testing/integration",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "Apache-2.0"
+repository = "https://github.com/Bobcatsfan33/substrate"
+homepage = "https://github.com/Bobcatsfan33/substrate"
+authors = ["Substrate Contributors"]
+
+[workspace.dependencies]
+# --- internal ---
+substrate-pager = { path = "crates/substrate-pager", version = "0.1.0" }
+substrate-wal = { path = "crates/substrate-wal", version = "0.1.0" }
+substrate-store = { path = "crates/substrate-store", version = "0.1.0" }
+
+# --- core (sync, no runtime) ---
+blake3 = "1.5"
+crc32c = "0.6"
+thiserror = "2.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1.3"
+tempfile = "3"
+
+# --- async, store layer only (doc 02 §5.1: no async in pager/wal) ---
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync", "time"] }
+object_store = { version = "0.11", features = ["aws"] }
+bytes = "1"
+futures = "0.3"
+async-trait = "0.1"
+
+# --- testing ---
+proptest = "1.5"
+criterion = "0.5"
+
+[profile.release]
+debug = true          # keep symbols: a storage engine you cannot profile in prod is a liability
+overflow-checks = true # arithmetic on page/lsn arithmetic must never silently wrap
+
+[profile.test]
+overflow-checks = true

@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy -D warnings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-targets
+      - name: doc tests
+        run: cargo test --workspace --doc
+
+  # CLAUDE.md rule 5: airgap is a compile-time amputation, not a runtime toggle.
+  # This job proves it by running the suite with no route to the outside world.
+  # A test that needs the network to pass is a test that fails.
+  no-egress:
+    name: no-egress (airgap)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Vendor and pre-build WITH network, so the isolated run needs nothing.
+      - name: Vendor dependencies
+        run: |
+          mkdir -p .cargo
+          cargo vendor vendor > .cargo/vendor-config.toml
+          cat .cargo/vendor-config.toml >> .cargo/config.toml || cp .cargo/vendor-config.toml .cargo/config.toml
+      - name: Pre-build test binaries (network available)
+        run: cargo test --workspace --features airgap --offline --no-run
+
+      # Now sever the network entirely and run.
+      - name: Run suite with no network namespace
+        run: |
+          docker run --rm --network none \
+            -v "$PWD":/w -w /w \
+            -v "$HOME/.cargo/registry":/usr/local/cargo/registry \
+            -e CARGO_TERM_COLOR=always \
+            rust:1-slim \
+            cargo test --workspace --features airgap --offline
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check bans licenses sources

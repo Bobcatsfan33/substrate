@@ -1,0 +1,18 @@
+[package]
+name = "substrate-integration-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+substrate-pager.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
+
+[features]
+default = []
+airgap = ["substrate-pager/airgap"]

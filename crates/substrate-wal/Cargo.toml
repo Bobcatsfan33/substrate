@@ -1,0 +1,25 @@
+[package]
+name = "substrate-wal"
+description = "Append-only write-ahead log with deterministic, idempotent crash recovery."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["database", "wal", "crash-recovery", "durability"]
+categories = ["database-implementations"]
+
+[dependencies]
+substrate-pager.workspace = true
+crc32c.workspace = true
+thiserror.workspace = true
+serde = { workspace = true }
+bincode.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
+
+[features]
+default = []
+airgap = ["substrate-pager/airgap"]

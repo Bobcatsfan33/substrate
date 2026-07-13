@@ -1,0 +1,21 @@
+# cargo-deny: license, advisory, and supply-chain policy.
+# A storage engine's dependency tree is part of its attack surface.
+
+[licenses]
+version = 2
+# Permissive only. A copyleft dependency in an Apache-2.0 engine that two products
+# link into their binaries is a licensing problem discovered far too late.
+allow = ["Apache-2.0", "MIT", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "CC0-1.0", "Zlib"]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

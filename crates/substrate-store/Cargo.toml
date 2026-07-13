@@ -1,0 +1,28 @@
+[package]
+name = "substrate-store"
+description = "Object-storage tiering for substrate: sleep, wake, and read-through caching."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["database", "object-storage", "s3", "tiering"]
+categories = ["database-implementations"]
+
+[dependencies]
+substrate-pager.workspace = true
+substrate-wal.workspace = true
+thiserror.workspace = true
+serde = { workspace = true }
+tokio.workspace = true
+bytes.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+object_store.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[features]
+default = []
+airgap = ["substrate-pager/airgap", "substrate-wal/airgap"]
