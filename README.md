@@ -69,7 +69,9 @@ This engine was written fast, and largely by an AI. If you are about to put data
 
 **Coverage-guided fuzzing.** The same invariants, driven by a fuzzer that watches which branches the engine takes and steers toward the ones nobody has hit. A quarter of a million executions per minute, and the on-disk format cannot change without the fuzz target changing in the same commit.
 
-**Crash injection** *(landing in P2 with the WAL)*. A filesystem layer that kills writes at any byte boundary. The property: after any crash and recovery, the store equals **some prefix of committed transactions**. No torn state, no lost commit.
+**Crash injection.** A filesystem layer that kills writes at any byte boundary — inside a page write, inside a WAL record, between the commit fsync and the manifest install. **10,000 randomized crash-and-recover cycles in CI** (50,000 locally), plus a run against a real disk where `fsync` is a genuine syscall. The property: after a crash anywhere, the recovered store equals **some prefix of committed transactions**, and anything `commit()` acknowledged is still there.
+
+It has already found three real durability bugs — including a recovery that was not idempotent, which would have corrupted any database that crashed *while recovering from a crash*.
 
 **Deterministic replay.** The same log replayed twice yields byte-identical manifests. If recovery isn't deterministic, it isn't verifiable, and nothing else here means anything.
 
