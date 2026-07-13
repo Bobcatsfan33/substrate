@@ -94,6 +94,14 @@ pub enum PagerError {
     #[error("{0:?} is not a valid content hash (expected 64 hex characters)")]
     MalformedId(String),
 
+    /// A storage backend beneath the pager failed.
+    ///
+    /// The pager does not know whether a page lives on a local disk, in a cache, or in an S3 bucket
+    /// in another region — and it must not (CLAUDE.md rule 2). When a backend it cannot see fails,
+    /// this is how the failure reaches it without dragging that backend's error type into the core.
+    #[error("storage backend failed: {0}")]
+    Backend(String),
+
     /// The filesystem said no.
     #[error("i/o error at {path}: {source}")]
     Io {
@@ -115,6 +123,11 @@ impl PagerError {
             path: path.into(),
             source,
         }
+    }
+
+    /// Wrap a failure from a backend the pager cannot see (object storage, a cache tier).
+    pub fn backend(detail: impl std::fmt::Display) -> Self {
+        PagerError::Backend(detail.to_string())
     }
 
     /// True if this error indicates on-disk corruption rather than a logical mistake.

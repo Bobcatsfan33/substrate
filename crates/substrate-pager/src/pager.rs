@@ -353,6 +353,23 @@ impl Pager {
         Ok(id)
     }
 
+    /// Assemble a store from a caller-supplied CAS and manifest store.
+    ///
+    /// This is the seam `substrate-store` reaches through to slide an object-storage tier
+    /// underneath the pager without the pager knowing anything about it — which is the whole point
+    /// of CLAUDE.md rule 2. The pager does not know whether a page came from a local disk, a cache,
+    /// or an S3 bucket in another region, and it must not: the moment it does, tiering stops being
+    /// implementable in one place.
+    pub fn from_parts(
+        cas: Arc<dyn Cas>,
+        manifests: Arc<dyn ManifestStore>,
+        config: StoreConfig,
+    ) -> Result<Self> {
+        validate_page_size(config.page_size)?;
+        Self::guard_keyed_hash(&config)?;
+        Pager::assemble(cas, manifests, config, Arc::new(SystemClock))
+    }
+
     /// The canonical empty root manifest for this store, persisting it if needed.
     ///
     /// **Recovery always replays from a fixed base — this, or a checkpoint — never from whatever

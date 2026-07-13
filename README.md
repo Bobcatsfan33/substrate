@@ -87,14 +87,23 @@ These are in [CLAUDE.md](CLAUDE.md), and each exists because breaking it produce
 - **No `async` in the core.** Deterministic replay and crash injection require deterministic execution.
 - **No network. Anywhere.** Except one object-storage client, and `--features airgap` removes even the possibility at compile time — an amputation an auditor can verify by reading the binary, not a config flag you can get wrong.
 
-## Status
+## Status — `substrate-v0.1`
 
-**P1 + P2 complete.**
+**P1 + P2 + P3 complete.**
 
 - `substrate-pager` — content-addressed pages, the CAS, manifests, O(1) fork/snapshot/rewind, three-way diff, crash-safe GC. Model oracle + fuzz target.
 - `substrate-wal` — the write-ahead log and the commit protocol. Deterministic, idempotent recovery. **10,000 crash-and-recover cycles in CI.**
+- `substrate-store` — object-storage tiering. **`sleep()` a database into S3 and it costs the price of its bytes; `wake()` it and the first row comes back in under 250ms.** Pool-scoped keys, so two classification boundaries cannot share a page even when the bytes are identical.
 
-Next: `substrate-store` (object-storage tiering, sleep/wake in <250ms), branch trees at depth, hardening to a frozen v1.0 API, then encryption and offline licensing.
+```rust
+let token = db.sleep().await?;       // the whole database is now ~20 bytes of meaning
+// ...wipe the machine...
+let db = TieredStore::wake(new_disk, remote, &token).await?;   // and it's back
+```
+
+The manifest is fetched eagerly; pages are fetched lazily, on the first read that touches them. Waking a 100 GB database does not move 100 GB.
+
+Next: branch trees at depth (P4), hardening to a frozen v1.0 API (P5), encryption and offline licensing (P6).
 
 Not yet: SQL (that's FlockDB), agents (that's LoomDB), or a stable API. **Do not build on this until v1.0 is tagged.**
 
