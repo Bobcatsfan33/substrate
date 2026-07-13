@@ -9,8 +9,8 @@
 
 use crate::error::{PagerError, Result};
 use crate::page::{Page, PageHasher, PageId};
+use crate::vfs::{std_vfs, Vfs};
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -101,115 +101,89 @@ impl PinRegistry {
 pub struct FsCas {
     root: PathBuf,
     hasher: PageHasher,
+    vfs: Arc<dyn Vfs>,
 }
 
 impl FsCas {
-    /// Open (creating if absent) a CAS rooted at `root`.
+    /// Open (creating if absent) a CAS rooted at `root`, on the real filesystem.
     pub fn open(root: impl AsRef<Path>, hasher: PageHasher) -> Result<Self> {
+        FsCas::open_with_vfs(std_vfs(), root, hasher)
+    }
+
+    /// Open a CAS on a caller-supplied filesystem.
+    ///
+    /// This is how the crash-injection harness gets underneath the engine: it hands us a `Vfs`
+    /// that dies at a chosen byte, and we never notice the difference.
+    pub fn open_with_vfs(
+        vfs: Arc<dyn Vfs>,
+        root: impl AsRef<Path>,
+        hasher: PageHasher,
+    ) -> Result<Self> {
         let root = root.as_ref().join("pages");
-        std::fs::create_dir_all(&root).map_err(|e| PagerError::io(&root, e))?;
-        Ok(FsCas { root, hasher })
+        vfs.create_dir_all(&root)
+            .map_err(|e| PagerError::io(&root, e))?;
+        Ok(FsCas { root, hasher, vfs })
     }
 
     fn path_of(&self, id: PageId) -> PathBuf {
         let (a, b) = id.shard();
         self.root.join(a).join(b).join(id.to_hex())
     }
-
-    /// fsync a directory so that a rename or create within it is itself durable.
-    ///
-    /// Creating a file durably is not enough: the *directory entry* pointing at it must also
-    /// survive the crash, or recovery finds an inode with no name. Every filesystem person
-    /// learns this once, expensively.
-    fn fsync_dir(path: &Path) -> Result<()> {
-        let dir = std::fs::File::open(path).map_err(|e| PagerError::io(path, e))?;
-        dir.sync_all().map_err(|e| PagerError::io(path, e))
-    }
 }
 
 impl Cas for FsCas {
     fn put(&self, page: &Page) -> Result<()> {
-        let final_path = self.path_of(page.id());
+        let path = self.path_of(page.id());
 
         // Write-once: identical content is identical bytes, so a page that is already here is
-        // already correct. Re-writing it would be pure cost and a needless window of risk.
-        if final_path.exists() {
+        // already correct. Rewriting it would be pure cost and a needless window of risk.
+        if self.vfs.exists(&path) {
             return Ok(());
         }
-
-        let dir = final_path
-            .parent()
-            .ok_or_else(|| PagerError::io(&final_path, std::io::Error::other("no parent dir")))?;
-        std::fs::create_dir_all(dir).map_err(|e| PagerError::io(dir, e))?;
-
-        // Write to a temp file, fsync the *contents*, then atomically rename into place, then
-        // fsync the *directory*. A reader therefore never observes a partially written page:
-        // the page either has its final name and its full contents, or it does not exist.
-        let tmp = dir.join(format!(".tmp.{}", page.id().to_hex()));
-        {
-            let mut file = std::fs::File::create(&tmp).map_err(|e| PagerError::io(&tmp, e))?;
-            file.write_all(page.as_bytes())
-                .map_err(|e| PagerError::io(&tmp, e))?;
-            file.sync_all().map_err(|e| PagerError::io(&tmp, e))?;
-        }
-        std::fs::rename(&tmp, &final_path).map_err(|e| PagerError::io(&final_path, e))?;
-        Self::fsync_dir(dir)?;
-        Ok(())
+        self.vfs
+            .atomic_write(&path, page.as_bytes())
+            .map_err(|e| PagerError::io(&path, e))
     }
 
     fn get(&self, id: PageId) -> Result<Page> {
         let path = self.path_of(id);
-        let bytes = match std::fs::read(&path) {
+        let bytes = match self.vfs.read(&path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(PagerError::MissingPage(id))
             }
             Err(e) => return Err(PagerError::io(&path, e)),
         };
-        // Verify on every single read. This is the entire integrity story, and it is cheap
-        // enough (BLAKE3 runs at GB/s) that making it optional would be a false economy.
+        // Verify on every single read. This is the entire integrity story, and BLAKE3 runs at
+        // GB/s, so making it optional would be a false economy.
         Page::verify(&self.hasher, id, bytes)
     }
 
     fn contains(&self, id: PageId) -> Result<bool> {
-        Ok(self.path_of(id).exists())
+        Ok(self.vfs.exists(&self.path_of(id)))
     }
 
     fn remove(&self, id: PageId) -> Result<()> {
         let path = self.path_of(id);
-        match std::fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            // Already gone is success: GC must be idempotent, because it may be interrupted
-            // half-way through a sweep and re-run.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(PagerError::io(&path, e)),
-        }
+        self.vfs
+            .remove_file(&path)
+            .map_err(|e| PagerError::io(&path, e))
     }
 
     fn list(&self) -> Result<Vec<PageId>> {
         let mut out = Vec::new();
-        let shards = match std::fs::read_dir(&self.root) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
-            Err(e) => return Err(PagerError::io(&self.root, e)),
-        };
-        for shard in shards {
-            let shard = shard.map_err(|e| PagerError::io(&self.root, e))?;
-            let inner = match std::fs::read_dir(shard.path()) {
-                Ok(entries) => entries,
-                Err(_) => continue, // not a shard dir; ignore rather than fail a whole GC
-            };
-            for sub in inner {
-                let sub = sub.map_err(|e| PagerError::io(shard.path(), e))?;
-                let files = match std::fs::read_dir(sub.path()) {
-                    Ok(entries) => entries,
-                    Err(_) => continue,
-                };
-                for file in files {
-                    let file = file.map_err(|e| PagerError::io(sub.path(), e))?;
-                    let name = file.file_name();
-                    let Some(name) = name.to_str() else { continue };
-                    // Skip in-progress temp files: they are not pages yet.
+        for shard in self
+            .vfs
+            .read_dir(&self.root)
+            .map_err(|e| PagerError::io(&self.root, e))?
+        {
+            for sub in self.vfs.read_dir(&shard).unwrap_or_default() {
+                for file in self.vfs.read_dir(&sub).unwrap_or_default() {
+                    let Some(name) = file.file_name().and_then(|n| n.to_str()) else {
+                        continue;
+                    };
+                    // A `.tmp.` file is a write that was interrupted by a crash. It is not a
+                    // page, and must never be mistaken for one.
                     if name.starts_with(".tmp.") {
                         continue;
                     }

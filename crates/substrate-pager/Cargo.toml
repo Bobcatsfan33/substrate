@@ -25,3 +25,5 @@ default = []
 airgap = []
 # PageId = BLAKE3_keyed(pool_key, plaintext). Mandatory for CUI pools (docs/02 §9.1).
 keyed-hash = []
+# Crash-injection harness (CrashVfs, MemVfs). Test-only; not in a release build.
+test-util = []

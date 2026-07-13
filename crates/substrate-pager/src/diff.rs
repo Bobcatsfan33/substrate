@@ -238,7 +238,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn m(pages: &[(LogicalPageNo, &[u8])]) -> Manifest {
-        let mut manifest = Manifest::empty(DEFAULT_PAGE_SIZE, 0);
+        let mut manifest = Manifest::empty(DEFAULT_PAGE_SIZE);
         manifest.pages = pages
             .iter()
             .map(|(no, bytes)| (*no, PageId::of(bytes)))

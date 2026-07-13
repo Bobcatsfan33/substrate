@@ -9,6 +9,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # The feature set that represents a normal build plus the crash harness.
+  # NOT --all-features: `keyed-hash` is a mutually exclusive build mode, not an additive
+  # feature — it deliberately makes an unkeyed store impossible to construct, so it gets
+  # its own job below rather than being mixed in here.
+  FEATURES: substrate-pager/test-util
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -19,7 +24,7 @@ jobs:
     name: fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -29,23 +34,56 @@ jobs:
     name: clippy -D warnings
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo clippy --workspace --all-targets --features $FEATURES -- -D warnings
+      - name: clippy (keyed-hash build)
+        run: cargo clippy --workspace --all-targets --features substrate-pager/keyed-hash -- -D warnings
 
   test:
     name: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --all-targets
+      - run: cargo test --workspace --all-targets --features $FEATURES
       - name: doc tests
         run: cargo test --workspace --doc
+
+  # The durability gate. This is the one that matters.
+  #
+  # 10,000 randomized crash-and-recover cycles, killing the write path at a different byte
+  # every time. The property: after a crash at ANY byte boundary, the recovered store equals
+  # some prefix of committed transactions — no torn state, no lost commit.
+  #
+  # If this job ever goes red, nothing else in the repository is worth reviewing.
+  crash-recovery:
+    name: crash recovery (10k cycles)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p substrate-wal --release --features $FEATURES --test crash
+        env:
+          CRASH_RUNS: 10000
+
+  # `keyed-hash` is the CUI build: page identity is keyed, so an adversary who guesses a
+  # page's plaintext cannot confirm it, and an unkeyed store cannot be constructed at all.
+  # It changes the store's contract, so it is built and tested on its own.
+  keyed-hash:
+    name: keyed-hash (CUI build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --features substrate-pager/keyed-hash
+      - run: cargo test -p substrate-pager --features keyed-hash --lib --test keyed
 
   # CLAUDE.md rule 5: airgap is a compile-time amputation, not a runtime toggle.
   # This job proves it by running the suite with no route to the outside world.
@@ -54,34 +92,44 @@ jobs:
     name: no-egress (airgap)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      # Vendor and pre-build WITH network, so the isolated run needs nothing.
-      - name: Vendor dependencies
+      - name: Vendor dependencies (network available)
         run: |
           mkdir -p .cargo
-          cargo vendor vendor > .cargo/vendor-config.toml
-          cat .cargo/vendor-config.toml >> .cargo/config.toml || cp .cargo/vendor-config.toml .cargo/config.toml
-      - name: Pre-build test binaries (network available)
-        run: cargo test --workspace --features airgap --offline --no-run
+          cargo vendor vendor > vendor-config.toml
+          cat vendor-config.toml >> .cargo/config.toml
 
-      # Now sever the network entirely and run.
-      - name: Run suite with no network namespace
+      - name: Run the suite with no network namespace at all
         run: |
           docker run --rm --network none \
             -v "$PWD":/w -w /w \
-            -v "$HOME/.cargo/registry":/usr/local/cargo/registry \
             -e CARGO_TERM_COLOR=always \
+            -e CARGO_HOME=/w/.cargo-home \
             rust:1-slim \
-            cargo test --workspace --features airgap --offline
+            cargo test --workspace --offline \
+              --features substrate-pager/airgap,substrate-wal/airgap,substrate-pager/test-util
 
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check bans licenses sources
+
+  fuzz:
+    name: fuzz (smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-fuzz --locked
+      # A short run on every push. The point is not to find bugs in 60 seconds — it is to
+      # guarantee the target still BUILDS and still runs, so that a format change cannot
+      # quietly leave the fuzzer testing last week's format while reporting green.
+      - run: cargo fuzz run --fuzz-dir testing/fuzz pager_ops -- -max_total_time=60

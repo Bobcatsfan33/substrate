@@ -15,12 +15,12 @@
 
 use crate::error::{PagerError, Result};
 use crate::page::{LogicalPageNo, PageId};
+use crate::vfs::{std_vfs, Vfs};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// The content hash of a serialized [`Manifest`].
 ///
@@ -118,13 +118,24 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    /// An empty root manifest for a new store.
-    pub fn empty(page_size: usize, created_at_ms: u64) -> Self {
+    /// The canonical empty root manifest for a store of this page size.
+    ///
+    /// # Why `created_at_ms` is zero and not "now"
+    ///
+    /// The root manifest's identity must be a pure function of the store's shape — nothing else.
+    /// An earlier version stamped it with the wall clock, and the effect was quietly disastrous:
+    /// reopening a store produced a root with a *different* timestamp, hence a different
+    /// `ManifestId`, hence a different base for replay — so recovery rebuilt a database that did
+    /// not match the one the commit records described, and refused to open it.
+    ///
+    /// Deterministic replay begins at a deterministic root. The crash-recovery tests caught this
+    /// on their first run.
+    pub fn empty(page_size: usize) -> Self {
         Manifest {
             format_version: MANIFEST_FORMAT_VERSION,
             pages: BTreeMap::new(),
             parent: None,
-            created_at_ms,
+            created_at_ms: 0,
             schema_version: 0,
             page_size: page_size as u32,
         }
@@ -239,14 +250,21 @@ pub trait ManifestStore: Send + Sync {
 /// Manifests on the filesystem, under `<root>/manifests/aa/<id>`.
 pub struct FsManifestStore {
     root: PathBuf,
+    vfs: Arc<dyn Vfs>,
 }
 
 impl FsManifestStore {
-    /// Open (creating if absent) a manifest store rooted at `root`.
+    /// Open (creating if absent) a manifest store rooted at `root`, on the real filesystem.
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
+        FsManifestStore::open_with_vfs(std_vfs(), root)
+    }
+
+    /// Open a manifest store on a caller-supplied filesystem (crash injection).
+    pub fn open_with_vfs(vfs: Arc<dyn Vfs>, root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().join("manifests");
-        std::fs::create_dir_all(&root).map_err(|e| PagerError::io(&root, e))?;
-        Ok(FsManifestStore { root })
+        vfs.create_dir_all(&root)
+            .map_err(|e| PagerError::io(&root, e))?;
+        Ok(FsManifestStore { root, vfs })
     }
 
     fn path_of(&self, id: ManifestId) -> PathBuf {
@@ -259,32 +277,20 @@ impl ManifestStore for FsManifestStore {
     fn put(&self, manifest: &Manifest) -> Result<ManifestId> {
         let id = manifest.id()?;
         let path = self.path_of(id);
-        if path.exists() {
-            return Ok(id); // content-addressed: already correct
+        if self.vfs.exists(&path) {
+            return Ok(id); // content-addressed: already there means already correct
         }
-        let dir = path
-            .parent()
-            .ok_or_else(|| PagerError::io(&path, std::io::Error::other("no parent dir")))?;
-        std::fs::create_dir_all(dir).map_err(|e| PagerError::io(dir, e))?;
-
-        // Same write-temp-fsync-rename-fsync-dir dance as the CAS: a half-written manifest is
-        // a corrupt database root, which is the worst thing on this disk.
-        let tmp = dir.join(format!(".tmp.{}", id.to_hex()));
-        {
-            let mut file = std::fs::File::create(&tmp).map_err(|e| PagerError::io(&tmp, e))?;
-            file.write_all(&manifest.encode()?)
-                .map_err(|e| PagerError::io(&tmp, e))?;
-            file.sync_all().map_err(|e| PagerError::io(&tmp, e))?;
-        }
-        std::fs::rename(&tmp, &path).map_err(|e| PagerError::io(&path, e))?;
-        let dir_handle = std::fs::File::open(dir).map_err(|e| PagerError::io(dir, e))?;
-        dir_handle.sync_all().map_err(|e| PagerError::io(dir, e))?;
+        // Atomic: a half-written manifest is a corrupt view of the entire database, which is the
+        // worst object on this disk. It appears complete, or it does not appear.
+        self.vfs
+            .atomic_write(&path, &manifest.encode()?)
+            .map_err(|e| PagerError::io(&path, e))?;
         Ok(id)
     }
 
     fn get(&self, id: ManifestId) -> Result<Manifest> {
         let path = self.path_of(id);
-        let bytes = match std::fs::read(&path) {
+        let bytes = match self.vfs.read(&path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(PagerError::MissingManifest(id.to_hex()))
@@ -292,8 +298,9 @@ impl ManifestStore for FsManifestStore {
             Err(e) => return Err(PagerError::io(&path, e)),
         };
         let manifest = Manifest::decode(&bytes)?;
-        // Manifests are content-addressed, so verify on read exactly as pages are. A corrupt
-        // manifest is a corrupt view of the entire database; it must never be trusted quietly.
+        // Manifests are content-addressed, so verify on read exactly as pages are. A manifest
+        // whose bytes do not hash to its id has been corrupted or substituted, and must never be
+        // trusted quietly.
         let actual = manifest.id()?;
         if actual != id {
             return Err(PagerError::MissingManifest(format!(
@@ -306,35 +313,27 @@ impl ManifestStore for FsManifestStore {
     }
 
     fn contains(&self, id: ManifestId) -> Result<bool> {
-        Ok(self.path_of(id).exists())
+        Ok(self.vfs.exists(&self.path_of(id)))
     }
 
     fn remove(&self, id: ManifestId) -> Result<()> {
         let path = self.path_of(id);
-        match std::fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(PagerError::io(&path, e)),
-        }
+        self.vfs
+            .remove_file(&path)
+            .map_err(|e| PagerError::io(&path, e))
     }
 
     fn list(&self) -> Result<Vec<ManifestId>> {
         let mut out = Vec::new();
-        let shards = match std::fs::read_dir(&self.root) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
-            Err(e) => return Err(PagerError::io(&self.root, e)),
-        };
-        for shard in shards {
-            let shard = shard.map_err(|e| PagerError::io(&self.root, e))?;
-            let files = match std::fs::read_dir(shard.path()) {
-                Ok(entries) => entries,
-                Err(_) => continue,
-            };
-            for file in files {
-                let file = file.map_err(|e| PagerError::io(shard.path(), e))?;
-                let name = file.file_name();
-                let Some(name) = name.to_str() else { continue };
+        for shard in self
+            .vfs
+            .read_dir(&self.root)
+            .map_err(|e| PagerError::io(&self.root, e))?
+        {
+            for file in self.vfs.read_dir(&shard).unwrap_or_default() {
+                let Some(name) = file.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
                 if name.starts_with(".tmp.") {
                     continue;
                 }
@@ -400,7 +399,7 @@ mod tests {
     use crate::page::DEFAULT_PAGE_SIZE;
 
     fn manifest_with(pages: &[(LogicalPageNo, &[u8])]) -> Manifest {
-        let mut m = Manifest::empty(DEFAULT_PAGE_SIZE, 1_700_000_000_000);
+        let mut m = Manifest::empty(DEFAULT_PAGE_SIZE);
         for (no, bytes) in pages {
             m.pages.insert(*no, PageId::of(bytes));
         }

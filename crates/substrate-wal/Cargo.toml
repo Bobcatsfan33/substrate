@@ -19,6 +19,7 @@ bincode.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 tempfile.workspace = true
+substrate-pager = { workspace = true, features = ["test-util"] }
 
 [features]
 default = []

@@ -24,6 +24,7 @@ use crate::error::{PagerError, Result};
 use crate::gc::GcStats;
 use crate::manifest::{FsManifestStore, Manifest, ManifestId, ManifestStore, MemManifestStore};
 use crate::page::{validate_page_size, LogicalPageNo, Page, PageHasher, PageId, DEFAULT_PAGE_SIZE};
+use crate::vfs::{std_vfs, Vfs};
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -91,6 +92,13 @@ impl Txn {
     /// The manifest this transaction is layered on top of.
     pub fn base(&self) -> ManifestId {
         self.base
+    }
+
+    /// The staged writes. `None` means the logical page is being removed.
+    ///
+    /// `substrate-wal` reads this to log the transaction before it is applied.
+    pub fn writes(&self) -> &BTreeMap<LogicalPageNo, Option<PageId>> {
+        &self.writes
     }
 }
 
@@ -208,19 +216,30 @@ impl Pager {
     /// # }
     /// ```
     pub fn open(root: impl AsRef<Path>, config: StoreConfig) -> Result<Self> {
+        Pager::open_with(std_vfs(), root, config, Arc::new(SystemClock))
+    }
+
+    /// Open a store on a caller-supplied filesystem and clock.
+    ///
+    /// This is the seam the crash-injection harness reaches through. Hand it a [`Vfs`] that dies
+    /// at a chosen byte and a [`Clock`] that does not move, and every durable write in the engine
+    /// becomes both killable and deterministic — which is the only way to *prove* that a crash at
+    /// any byte boundary leaves some prefix of committed transactions, rather than merely
+    /// believing it.
+    pub fn open_with(
+        vfs: Arc<dyn Vfs>,
+        root: impl AsRef<Path>,
+        config: StoreConfig,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self> {
         validate_page_size(config.page_size)?;
         Self::guard_keyed_hash(&config)?;
 
         let root = root.as_ref();
-        let cas = FsCas::open(root, config.hasher.clone())?;
-        let manifests = FsManifestStore::open(root)?;
+        let cas = FsCas::open_with_vfs(Arc::clone(&vfs), root, config.hasher.clone())?;
+        let manifests = FsManifestStore::open_with_vfs(vfs, root)?;
 
-        Pager::assemble(
-            Arc::new(cas),
-            Arc::new(manifests),
-            config,
-            Arc::new(SystemClock),
-        )
+        Pager::assemble(Arc::new(cas), Arc::new(manifests), config, clock)
     }
 
     /// Create an in-memory store. Tests, and ephemeral forks.
@@ -270,7 +289,7 @@ impl Pager {
         // its head via the WAL (substrate-wal) — the pager alone has no notion of "the latest",
         // deliberately: inventing one here would be a second source of truth about what is
         // committed, and the WAL is the only one allowed to have that opinion.
-        let root = Manifest::empty(config.page_size, clock.now_ms());
+        let root = Manifest::empty(config.page_size);
         let head = manifests.put(&root)?;
 
         Ok(Pager {
@@ -298,6 +317,69 @@ impl Pager {
             config: self.config.clone(),
             clock: Arc::clone(&self.clock),
         })
+    }
+
+    /// Compute the manifest a transaction *would* produce, without persisting anything.
+    ///
+    /// This is the seam that lets `substrate-wal` implement the commit protocol in the right
+    /// order (docs/02 §3.1): derive the manifest, write the WAL commit record and fsync it —
+    /// **that** is the commit point — and only then install the manifest. A crash between the
+    /// fsync and the install is harmless, because recovery re-derives the identical manifest
+    /// from the log and installs it. Idempotent, by construction.
+    ///
+    /// Returns `None` if the transaction changes nothing.
+    pub fn derive_next(
+        &self,
+        base: ManifestId,
+        writes: &BTreeMap<LogicalPageNo, Option<PageId>>,
+        created_at_ms: u64,
+    ) -> Result<Option<(Manifest, ManifestId)>> {
+        let base_manifest = self.manifests.get(base)?;
+        let next = base_manifest.derive(writes, base, created_at_ms);
+        if next.pages == base_manifest.pages {
+            return Ok(None);
+        }
+        let id = next.id()?;
+        Ok(Some((next, id)))
+    }
+
+    /// Persist a manifest and make it this store's head.
+    ///
+    /// Idempotent: manifests are content-addressed, so installing one twice is one manifest.
+    /// Recovery leans on that hard.
+    pub fn install(&self, manifest: &Manifest) -> Result<ManifestId> {
+        let id = self.manifests.put(manifest)?;
+        self.set_head(id);
+        Ok(id)
+    }
+
+    /// The canonical empty root manifest for this store, persisting it if needed.
+    ///
+    /// **Recovery always replays from a fixed base — this, or a checkpoint — never from whatever
+    /// the head happens to be right now.** An earlier version fell back to the current head, which
+    /// worked perfectly the first time and diverged the second: replaying an already-replayed log
+    /// derived the first transaction from the *recovered* head rather than the root, producing a
+    /// manifest that did not match the commit record. The store then refused to open at all.
+    ///
+    /// Recovery runs after a crash. A crash *during* recovery is not exotic — it is Tuesday — so
+    /// recovery has to be idempotent, and idempotence starts with a fixed base.
+    pub fn root_manifest(&self) -> Result<ManifestId> {
+        let root = Manifest::empty(self.config.page_size);
+        self.manifests.put(&root)
+    }
+
+    /// Point this store at an already-persisted manifest, without touching the CAS.
+    pub fn set_head_to(&self, id: ManifestId) -> Result<()> {
+        if !self.manifests.contains(id)? {
+            return Err(PagerError::MissingManifest(id.to_hex()));
+        }
+        self.set_head(id);
+        Ok(())
+    }
+
+    /// The store's manifest store, for crates that must persist manifests during recovery.
+    pub fn manifest_store(&self) -> Arc<dyn ManifestStore> {
+        Arc::clone(&self.manifests)
     }
 
     fn head_id(&self) -> ManifestId {

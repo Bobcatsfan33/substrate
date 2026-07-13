@@ -87,9 +87,12 @@ These are in [CLAUDE.md](CLAUDE.md), and each exists because breaking it produce
 
 ## Status
 
-**P1 complete.** Content-addressed pages, the CAS, manifests, O(1) fork/snapshot/rewind, three-way diff, crash-safe GC — with the model oracle and the fuzz target.
+**P1 + P2 complete.**
 
-Next: `substrate-wal` (WAL + crash recovery), `substrate-store` (object-storage tiering, sleep/wake), branch trees at depth, hardening to a frozen v1.0 API, then encryption and offline licensing.
+- `substrate-pager` — content-addressed pages, the CAS, manifests, O(1) fork/snapshot/rewind, three-way diff, crash-safe GC. Model oracle + fuzz target.
+- `substrate-wal` — the write-ahead log and the commit protocol. Deterministic, idempotent recovery. **10,000 crash-and-recover cycles in CI.**
+
+Next: `substrate-store` (object-storage tiering, sleep/wake in <250ms), branch trees at depth, hardening to a frozen v1.0 API, then encryption and offline licensing.
 
 Not yet: SQL (that's FlockDB), agents (that's LoomDB), or a stable API. **Do not build on this until v1.0 is tagged.**
 
