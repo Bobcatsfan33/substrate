@@ -35,6 +35,9 @@ pub const MIN_PAGE_SIZE: usize = 4 * 1024;
 /// The largest page size a store may be created with.
 pub const MAX_PAGE_SIZE: usize = 16 * 1024 * 1024;
 
+/// A set of page ids. What GC and the scrubber both traffic in.
+pub type PageIdSet = std::collections::HashSet<PageId>;
+
 /// A logical page number: the address a database uses, independent of where the bytes live.
 ///
 /// The indirection between a `LogicalPageNo` and a [`PageId`] is what makes fork, snapshot,

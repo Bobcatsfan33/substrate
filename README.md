@@ -87,9 +87,9 @@ These are in [CLAUDE.md](CLAUDE.md), and each exists because breaking it produce
 - **No `async` in the core.** Deterministic replay and crash injection require deterministic execution.
 - **No network. Anywhere.** Except one object-storage client, and `--features airgap` removes even the possibility at compile time — an amputation an auditor can verify by reading the binary, not a config flag you can get wrong.
 
-## Status — `substrate-v0.2`
+## Status — `substrate-v1.0` · **API frozen**
 
-**P1–P4 complete.**
+**P1–P5 complete.** The API is frozen and semver applies: see [docs/substrate-api.md](docs/substrate-api.md) for the surface and the compatibility promise.
 
 - `substrate-pager` — content-addressed pages, the CAS, manifests, O(1) fork/snapshot/rewind, three-way diff, crash-safe GC. Model oracle + fuzz target.
 - `substrate-wal` — the write-ahead log and the commit protocol. Deterministic, idempotent recovery. **10,000 crash-and-recover cycles in CI.**
@@ -116,9 +116,11 @@ The manifest is fetched eagerly; pages are fetched lazily, on the first read tha
 
 The benchmarks caught two real performance bugs the moment they existed: every page read was deserializing an entire manifest (**1.9 ms → 180 ns**), and every one-page commit was resolving the whole base manifest, so overlays were paying for themselves and delivering nothing (**3.7 ms → 577 µs**). Both fixes are in. The honest caveat is recorded in [docs/02 §7.1](docs/02-embedded-single-node-engine-architecture.md).
 
-Next: hardening to a frozen v1.0 API (P5), encryption and offline licensing (P6).
+- **P5** — hardening. Integrity scrubbing (finds bit rot in pages *nobody has read*), repair-from-object-storage that **verifies the replica before installing it**, trait-based metrics hooks with no library dependency, and the frozen v1.0 API surface.
 
-Not yet: SQL (that's FlockDB), agents (that's LoomDB), or a stable API. **Do not build on this until v1.0 is tagged.**
+Next: encryption and offline licensing (P6).
+
+Not yet: SQL (that's FlockDB), agents (that's LoomDB). **The API is now stable — build on it.**
 
 ## Layout
 

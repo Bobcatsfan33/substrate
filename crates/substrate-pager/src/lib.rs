@@ -87,8 +87,10 @@ mod diff;
 mod error;
 mod gc;
 mod manifest;
+mod metrics;
 mod page;
 mod pager;
+mod scrub;
 /// Crash-injection harness. Enabled by the `test-util` feature; never in a release build.
 #[cfg(feature = "test-util")]
 pub mod testing;
@@ -104,10 +106,13 @@ pub use manifest::{
     FsManifestStore, Manifest, ManifestBody, ManifestId, ManifestStore, MemManifestStore,
     PageChanges, PageMap, MANIFEST_FORMAT_VERSION, MAX_OVERLAY_DEPTH,
 };
+pub use metrics::{Metrics, NoMetrics};
 pub use page::{
-    LogicalPageNo, Page, PageHasher, PageId, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, MIN_PAGE_SIZE,
+    LogicalPageNo, Page, PageHasher, PageId, PageIdSet, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE,
+    MIN_PAGE_SIZE,
 };
 pub use pager::{PageStore, Pager, StoreConfig, Txn};
+pub use scrub::{CorruptionReport, Scrubber};
 pub use vfs::{std_vfs, StdVfs, Vfs};
 
 /// The model oracle: a deliberately naive reference implementation of what a page store *means*.

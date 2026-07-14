@@ -510,6 +510,32 @@ impl Pager {
         Arc::clone(&self.manifests)
     }
 
+    /// The store's content-addressed store.
+    pub fn cas(&self) -> Arc<dyn Cas> {
+        Arc::clone(&self.cas.cas)
+    }
+
+    /// Re-verify every page reachable from these manifests.
+    ///
+    /// Finds bit rot in pages **nobody has read** — which are precisely the pages that quietly rot
+    /// for two years and are discovered on the day you finally need them. See `scrub.rs`.
+    ///
+    /// Reports; does not repair. Repair means fetching a healthy copy, and the pager does not know
+    /// object storage exists (CLAUDE.md rule 2). `substrate-store` consumes the report.
+    pub fn scrub(&self, live: &[ManifestId]) -> Result<crate::CorruptionReport> {
+        let resolved: Vec<crate::PageIdSet> = live
+            .iter()
+            .map(|id| Ok(self.resolve(id)?.into_values().collect()))
+            .collect::<Result<_>>()?;
+
+        crate::Scrubber::new(
+            self.cas(),
+            self.manifest_store(),
+            Arc::new(crate::NoMetrics),
+        )
+        .scrub(live, &resolved)
+    }
+
     fn head_id(&self) -> ManifestId {
         // A poisoned lock means a thread panicked while holding the head. The head is a single
         // `Copy` id — it cannot be torn — so recovering it is safe and beats propagating a panic

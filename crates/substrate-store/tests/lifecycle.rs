@@ -440,3 +440,124 @@ async fn minio_round_trip() -> Result<()> {
     );
     Ok(())
 }
+
+/// **Scrub finds bit rot that nobody read, and repair fixes it from object storage — provably.**
+///
+/// This is the full integrity story end to end:
+///
+/// 1. A page rots on the local disk. Nobody has read it, so nothing has noticed.
+/// 2. A scrub walks the store, re-hashes everything, and finds it.
+/// 3. Repair fetches the replica from object storage — and **verifies it before installing it**,
+///    because content addressing means we do not have to trust the remote copy, we can check it.
+#[tokio::test(flavor = "multi_thread")]
+async fn scrub_finds_rot_and_repair_fixes_it_from_object_storage() -> Result<()> {
+    let remote = RemoteTier::new(Arc::new(InMemory::new()), "acme");
+    let home = tempfile::tempdir().expect("tempdir");
+    let db = TieredStore::open(home.path(), remote, config("acme")).await?;
+    let pager = db.pager();
+
+    let mut txn = pager.begin()?;
+    for page_no in 0..8u64 {
+        pager.write(&mut txn, page_no, content(page_no as u8, 200))?;
+    }
+    let head = pager.commit(txn)?;
+    db.flush().await?; // healthy replicas now exist remotely
+
+    // Nothing is wrong yet.
+    let report = pager.scrub(&[head])?;
+    assert!(
+        report.is_healthy(),
+        "a fresh store should be clean: {report}"
+    );
+    assert_eq!(report.healthy, 8);
+
+    // --- rot a page on the local disk, behind the engine's back ---
+    let rotted = substrate_pager::PageId::of(&content(3, 200));
+    let hex = rotted.to_hex();
+    let path = home
+        .path()
+        .join("pages")
+        .join(&hex[0..2])
+        .join(&hex[2..4])
+        .join(&hex);
+    std::fs::write(&path, b"tampered!!!!").expect("corrupt the page");
+
+    // --- the scrub finds it, without anyone having read it ---
+    let report = pager.scrub(&[head])?;
+    assert!(!report.is_healthy(), "the scrub missed the rot");
+    assert_eq!(report.corrupt, vec![rotted]);
+    assert_eq!(report.healthy, 7);
+
+    // --- repair, from the verified remote replica ---
+    let repair = db.repair(&report).await?;
+    assert!(
+        repair.is_complete(),
+        "the page should have been repairable: {repair}"
+    );
+    assert_eq!(repair.repaired.len(), 1);
+
+    // --- and now it is genuinely fixed ---
+    assert_eq!(pager.read(&head, 3)?.as_bytes(), content(3, 200).as_slice());
+    assert!(pager.scrub(&[head])?.is_healthy());
+    Ok(())
+}
+
+/// If the remote replica is damaged too, the page is **lost**, and we say so rather than installing
+/// garbage.
+///
+/// The tempting thing here is to install the remote copy anyway — it is, after all, the only copy we
+/// have. That would replace a corruption we have detected with one we have not, which is strictly
+/// worse: the customer would then have a database that reads without error and returns wrong bytes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_page_damaged_in_both_tiers_is_reported_lost_not_quietly_installed() -> Result<()> {
+    use object_store::ObjectStore;
+
+    let backend = Arc::new(InMemory::new());
+    let remote = RemoteTier::new(backend.clone(), "acme");
+    let home = tempfile::tempdir().expect("tempdir");
+    let db = TieredStore::open(home.path(), remote.clone(), config("acme")).await?;
+    let pager = db.pager();
+
+    let mut txn = pager.begin()?;
+    pager.write(&mut txn, 0, b"precious".to_vec())?;
+    let head = pager.commit(txn)?;
+    db.flush().await?;
+
+    let page_id = substrate_pager::PageId::of(b"precious");
+
+    // Rot it locally...
+    let hex = page_id.to_hex();
+    let path = home
+        .path()
+        .join("pages")
+        .join(&hex[0..2])
+        .join(&hex[2..4])
+        .join(&hex);
+    std::fs::write(&path, b"local rot").expect("corrupt locally");
+
+    // ...and rot the replica too.
+    backend
+        .put(
+            &remote.page_key(page_id),
+            bytes::Bytes::from_static(b"remote rot").into(),
+        )
+        .await
+        .expect("corrupt remotely");
+
+    let report = pager.scrub(&[head])?;
+    assert_eq!(report.corrupt, vec![page_id]);
+
+    let repair = db.repair(&report).await?;
+    assert!(
+        !repair.is_complete(),
+        "a page damaged in BOTH tiers must not be reported as repaired"
+    );
+    assert_eq!(repair.unrepairable, vec![page_id.to_hex()]);
+    assert!(repair.to_string().contains("COULD NOT BE REPAIRED"));
+
+    // And crucially: the corrupt remote bytes were NOT installed over the corrupt local ones.
+    // The read still fails loudly. A database that returns wrong bytes without an error is worse
+    // than one that refuses to read.
+    assert!(pager.read(&head, 0).is_err_and(|e| e.is_corruption()));
+    Ok(())
+}

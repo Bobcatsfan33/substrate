@@ -261,3 +261,95 @@ impl std::fmt::Debug for TieredStore {
             .finish()
     }
 }
+
+/// What a repair pass did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RepairReport {
+    /// Pages re-fetched from object storage and verified.
+    pub repaired: Vec<String>,
+    /// Pages that were damaged locally **and** unavailable or damaged remotely.
+    ///
+    /// These are lost. Not "probably fine" — lost. The only honest thing to do is say so, loudly,
+    /// with the ids, so an operator can go to their backups rather than discover it later.
+    pub unrepairable: Vec<String>,
+}
+
+impl RepairReport {
+    /// True if everything damaged was fixed.
+    pub fn is_complete(&self) -> bool {
+        self.unrepairable.is_empty()
+    }
+}
+
+impl std::fmt::Display for RepairReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_complete() {
+            return write!(
+                f,
+                "repaired {} page(s) from object storage",
+                self.repaired.len()
+            );
+        }
+        write!(
+            f,
+            "repaired {} page(s); {} PAGE(S) COULD NOT BE REPAIRED — damaged locally and \
+             unavailable remotely. These are lost; restore from backup.",
+            self.repaired.len(),
+            self.unrepairable.len()
+        )
+    }
+}
+
+impl TieredStore {
+    /// Repair the damage a scrub found, by re-fetching healthy copies from object storage.
+    ///
+    /// # Why this lives here and not in the pager
+    ///
+    /// Repair means fetching a known-good replica, and `substrate-pager` does not know object
+    /// storage exists (CLAUDE.md rule 2). It finds the damage and hands over a
+    /// [`CorruptionReport`](substrate_pager::CorruptionReport); this consumes it.
+    ///
+    /// # Why this is safe
+    ///
+    /// Content addressing. A page's id *is* the hash of its bytes, so a replacement fetched from
+    /// object storage can be **proven** correct before it is installed — we do not have to trust the
+    /// remote copy, we can check it. If the remote copy is also damaged, it fails the same check and
+    /// we report the page as unrepairable rather than swapping one corruption for another.
+    ///
+    /// This is the payoff for hashing everything. In a system without content addressing, "restore
+    /// this page from the replica" is an act of faith.
+    pub async fn repair(&self, report: &substrate_pager::CorruptionReport) -> Result<RepairReport> {
+        let mut out = RepairReport::default();
+        let damaged = report.corrupt.iter().chain(report.missing.iter());
+
+        for page_id in damaged {
+            let key = self.remote.page_key(*page_id);
+
+            let Some(bytes) = self.remote.get(&key).await? else {
+                out.unrepairable.push(page_id.to_hex());
+                continue;
+            };
+
+            // Verify BEFORE installing. The remote copy is not trusted — it is checked.
+            let page =
+                match substrate_pager::Page::new(&self.config.hasher, bytes, self.config.page_size)
+                {
+                    Ok(page) if page.id() == *page_id => page,
+                    _ => {
+                        // The replica is damaged too. Say so. Installing it would replace a corruption
+                        // we know about with one we do not.
+                        out.unrepairable.push(page_id.to_hex());
+                        continue;
+                    }
+                };
+
+            // The local CAS is write-once, so the damaged file must go before the good one lands.
+            let local = self.pager.cas();
+            local.remove(*page_id)?;
+            local.put(&page)?;
+            out.repaired.push(page_id.to_hex());
+        }
+
+        Ok(out)
+    }
+}
