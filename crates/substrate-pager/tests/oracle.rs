@@ -196,9 +196,11 @@ impl World {
     /// The engine's view of a store, as a plain map — directly comparable to the model.
     fn real_state(&self, idx: usize) -> Result<BTreeMap<LogicalPageNo, Vec<u8>>, PagerError> {
         let store = &self.real[idx];
-        let manifest = store.manifest(&store.head())?;
+        // resolve(), not manifest.body: an overlay manifest names only what it CHANGED, so reading
+        // its local map would report a fraction of the database.
+        let pages = store.resolve(&store.head())?;
         let mut out = BTreeMap::new();
-        for page_no in manifest.pages.keys() {
+        for page_no in pages.keys() {
             out.insert(*page_no, store.read_head(*page_no)?.into_bytes());
         }
         Ok(out)
@@ -233,7 +235,7 @@ impl World {
     /// garbage collections have happened since.
     fn assert_snapshots_intact(&self) -> Result<(), TestCaseError> {
         for (i, (real_snap, model_snap)) in self.snapshots.iter().enumerate() {
-            let manifest = match self.real[0].manifest(real_snap) {
+            let pages = match self.real[0].resolve(real_snap) {
                 Ok(m) => m,
                 Err(e) => {
                     return Err(TestCaseError::fail(format!(
@@ -241,7 +243,7 @@ impl World {
                     )))
                 }
             };
-            for page_no in manifest.pages.keys() {
+            for page_no in pages.keys() {
                 let real = self.real[0].read(real_snap, *page_no).map_err(|e| {
                     TestCaseError::fail(format!(
                         "snapshot {i}: page {page_no} unreadable — GC collected a live page: {e}"
@@ -402,8 +404,8 @@ fn gc_never_collects_a_page_that_something_still_points_at() -> Result<(), Pager
 
     // Every page of every live manifest must still be readable.
     for manifest_id in &live {
-        let manifest = db.manifest(manifest_id)?;
-        for page_no in manifest.pages.keys() {
+        let pages = db.resolve(manifest_id)?;
+        for page_no in pages.keys() {
             db.read(manifest_id, *page_no)
                 .map_err(|e| panic!("GC collected a live page {page_no} of {manifest_id}: {e}"))?;
         }
@@ -424,8 +426,8 @@ fn gc_never_collects_a_page_that_something_still_points_at() -> Result<(), Pager
     );
 
     // ...and what remains is still perfectly readable.
-    let manifest = db.manifest(&snapshots[0])?;
-    for page_no in manifest.pages.keys() {
+    let pages = db.resolve(&snapshots[0])?;
+    for page_no in pages.keys() {
         db.read(&snapshots[0], *page_no)?;
     }
     Ok(())

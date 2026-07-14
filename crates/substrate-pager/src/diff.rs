@@ -10,7 +10,7 @@
 //! Diffing is cheap because a manifest is just an ordered map of page ids: comparing two
 //! databases is comparing two sorted lists of hashes, not reading any data.
 
-use crate::manifest::{Manifest, ManifestId};
+use crate::manifest::{ManifestId, PageMap};
 use crate::page::{LogicalPageNo, PageId};
 use std::collections::BTreeSet;
 use std::ops::RangeInclusive;
@@ -75,14 +75,17 @@ impl PageDiff {
         ranges
     }
 
-    /// Compute the difference between two manifests.
-    pub fn between(from: &Manifest, to: &Manifest) -> PageDiff {
-        let page_nos: BTreeSet<LogicalPageNo> =
-            from.pages.keys().chain(to.pages.keys()).copied().collect();
+    /// Compute the difference between two **resolved** page maps.
+    ///
+    /// Takes maps rather than manifests because a manifest may be an overlay, which knows only what
+    /// it changed — diffing two overlays directly would compare their *deltas* rather than their
+    /// databases, and quietly report that two identical databases differ.
+    pub fn between(from: &PageMap, to: &PageMap) -> PageDiff {
+        let page_nos: BTreeSet<LogicalPageNo> = from.keys().chain(to.keys()).copied().collect();
 
         let mut changes = Vec::new();
         for page_no in page_nos {
-            match (from.get(page_no), to.get(page_no)) {
+            match (from.get(&page_no).copied(), to.get(&page_no).copied()) {
                 (Some(a), Some(b)) if a != b => {
                     changes.push((page_no, PageChange::Modified { from: a, to: b }))
                 }
@@ -160,21 +163,24 @@ impl ThreeWayDiff {
         base_id: ManifestId,
         a_id: ManifestId,
         b_id: ManifestId,
-        base: &Manifest,
-        a: &Manifest,
-        b: &Manifest,
+        base: &PageMap,
+        a: &PageMap,
+        b: &PageMap,
     ) -> ThreeWayDiff {
         let page_nos: BTreeSet<LogicalPageNo> = base
-            .pages
             .keys()
-            .chain(a.pages.keys())
-            .chain(b.pages.keys())
+            .chain(a.keys())
+            .chain(b.keys())
             .copied()
             .collect();
 
         let mut entries = Vec::new();
         for page_no in page_nos {
-            let (base_p, a_p, b_p) = (base.get(page_no), a.get(page_no), b.get(page_no));
+            let (base_p, a_p, b_p) = (
+                base.get(&page_no).copied(),
+                a.get(&page_no).copied(),
+                b.get(&page_no).copied(),
+            );
 
             // Four cases. That is genuinely all there is, and writing it as anything cleverer
             // than four cases would be a disservice to whoever debugs a bad merge at 3am.
@@ -234,16 +240,13 @@ impl ThreeWayDiff {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::page::DEFAULT_PAGE_SIZE;
     use std::collections::BTreeMap;
 
-    fn m(pages: &[(LogicalPageNo, &[u8])]) -> Manifest {
-        let mut manifest = Manifest::empty(DEFAULT_PAGE_SIZE);
-        manifest.pages = pages
+    fn m(pages: &[(LogicalPageNo, &[u8])]) -> PageMap {
+        pages
             .iter()
             .map(|(no, bytes)| (*no, PageId::of(bytes)))
-            .collect::<BTreeMap<_, _>>();
-        manifest
+            .collect()
     }
 
     fn ids() -> (ManifestId, ManifestId, ManifestId) {
@@ -357,7 +360,7 @@ mod tests {
             (0..10_000).map(|i| (i, b"cold" as &[u8])).collect();
         let base = m(&pages);
         let mut a = base.clone();
-        a.pages.insert(4_242, PageId::of(b"one hot page"));
+        a.insert(4_242, PageId::of(b"one hot page"));
         let b = base.clone();
 
         let (bi, ai, b_i) = ids();

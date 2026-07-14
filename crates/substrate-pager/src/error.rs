@@ -94,6 +94,24 @@ pub enum PagerError {
     #[error("{0:?} is not a valid content hash (expected 64 hex characters)")]
     MalformedId(String),
 
+    /// A branch or tag name is already taken.
+    #[error("{kind} {name:?} already exists; moving it would discard what it points at")]
+    RefExists {
+        /// `"branch"` or `"tag"`.
+        kind: &'static str,
+        /// The name.
+        name: String,
+    },
+
+    /// A branch or tag does not exist.
+    #[error("no such {kind}: {name:?}")]
+    NoSuchRef {
+        /// `"branch"` or `"tag"`.
+        kind: &'static str,
+        /// The name.
+        name: String,
+    },
+
     /// A storage backend beneath the pager failed.
     ///
     /// The pager does not know whether a page lives on a local disk, in a cache, or in an S3 bucket

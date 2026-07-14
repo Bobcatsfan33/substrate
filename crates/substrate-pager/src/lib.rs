@@ -80,6 +80,7 @@
 // code that proves the library is right.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+mod branch;
 mod cas;
 mod clock;
 mod diff;
@@ -93,13 +94,15 @@ mod pager;
 pub mod testing;
 mod vfs;
 
+pub use branch::{BranchTree, RefName};
 pub use cas::{Cas, FsCas, MemCas};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use diff::{PageChange, PageClass, PageDiff, ThreeWayDiff};
 pub use error::{PagerError, Result};
 pub use gc::GcStats;
 pub use manifest::{
-    FsManifestStore, Manifest, ManifestId, ManifestStore, MemManifestStore, MANIFEST_FORMAT_VERSION,
+    FsManifestStore, Manifest, ManifestBody, ManifestId, ManifestStore, MemManifestStore,
+    PageChanges, PageMap, MANIFEST_FORMAT_VERSION, MAX_OVERLAY_DEPTH,
 };
 pub use page::{
     LogicalPageNo, Page, PageHasher, PageId, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, MIN_PAGE_SIZE,

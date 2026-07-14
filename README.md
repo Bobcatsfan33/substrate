@@ -87,9 +87,9 @@ These are in [CLAUDE.md](CLAUDE.md), and each exists because breaking it produce
 - **No `async` in the core.** Deterministic replay and crash injection require deterministic execution.
 - **No network. Anywhere.** Except one object-storage client, and `--features airgap` removes even the possibility at compile time — an amputation an auditor can verify by reading the binary, not a config flag you can get wrong.
 
-## Status — `substrate-v0.1`
+## Status — `substrate-v0.2`
 
-**P1 + P2 + P3 complete.**
+**P1–P4 complete.**
 
 - `substrate-pager` — content-addressed pages, the CAS, manifests, O(1) fork/snapshot/rewind, three-way diff, crash-safe GC. Model oracle + fuzz target.
 - `substrate-wal` — the write-ahead log and the commit protocol. Deterministic, idempotent recovery. **10,000 crash-and-recover cycles in CI.**
@@ -103,7 +103,20 @@ let db = TieredStore::wake(new_disk, remote, &token).await?;   // and it's back
 
 The manifest is fetched eagerly; pages are fetched lazily, on the first read that touches them. Waking a 100 GB database does not move 100 GB.
 
-Next: branch trees at depth (P4), hardening to a frozen v1.0 API (P5), encryption and offline licensing (P6).
+- `substrate-pager` (P4) — **branch trees at depth.** Forks of forks of forks, overlay manifests that collapse at depth 8, merge-base computation, named branches and tags.
+
+### Measured (`cargo bench -p substrate-pager`)
+
+| Operation | Target | Measured |
+|---|---|---|
+| fork | < 1 ms | **98 ns** — flat from 100 to 16,384 pages |
+| snapshot | < 1 ms | **15 ns** |
+| read one page, overlay depth 8 vs flat | < 20 % overhead | **+1.4 %** (64 KiB pages) |
+| three-way diff, 1 GiB logical, 16 changed pages | scales with *changed* | **7.4 ms** |
+
+The benchmarks caught two real performance bugs the moment they existed: every page read was deserializing an entire manifest (**1.9 ms → 180 ns**), and every one-page commit was resolving the whole base manifest, so overlays were paying for themselves and delivering nothing (**3.7 ms → 577 µs**). Both fixes are in. The honest caveat is recorded in [docs/02 §7.1](docs/02-embedded-single-node-engine-architecture.md).
+
+Next: hardening to a frozen v1.0 API (P5), encryption and offline licensing (P6).
 
 Not yet: SQL (that's FlockDB), agents (that's LoomDB), or a stable API. **Do not build on this until v1.0 is tagged.**
 

@@ -22,10 +22,13 @@ use crate::clock::{Clock, SystemClock};
 use crate::diff::{PageDiff, ThreeWayDiff};
 use crate::error::{PagerError, Result};
 use crate::gc::GcStats;
-use crate::manifest::{FsManifestStore, Manifest, ManifestId, ManifestStore, MemManifestStore};
+use crate::manifest::{
+    FsManifestStore, Manifest, ManifestId, ManifestStore, MemManifestStore, PageChanges, PageMap,
+    MAX_OVERLAY_DEPTH,
+};
 use crate::page::{validate_page_size, LogicalPageNo, Page, PageHasher, PageId, DEFAULT_PAGE_SIZE};
 use crate::vfs::{std_vfs, Vfs};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -174,6 +177,21 @@ pub trait PageStore: Send + Sync {
     /// Load a manifest by id.
     fn manifest(&self, id: &ManifestId) -> Result<Manifest>;
 
+    /// Materialise a manifest's complete page map, walking its overlay chain.
+    ///
+    /// O(pages). Use [`PageStore::lookup`] when you want one page — that is O(depth), and depth is
+    /// bounded by `MAX_OVERLAY_DEPTH`.
+    fn resolve(&self, id: &ManifestId) -> Result<PageMap>;
+
+    /// Resolve one logical page through the overlay chain. O(depth), bounded at 8.
+    fn lookup(&self, id: &ManifestId, page_no: LogicalPageNo) -> Result<Option<PageId>>;
+
+    /// The most recent common ancestor of two manifests in the commit DAG.
+    ///
+    /// This is the **merge base**: the point the two branches agreed, and the third input every
+    /// three-way merge needs. `None` if they share no history at all.
+    fn merge_base(&self, a: &ManifestId, b: &ManifestId) -> Result<Option<ManifestId>>;
+
     /// The page size this store was created with.
     fn page_size(&self) -> usize;
 
@@ -185,9 +203,55 @@ pub trait PageStore: Send + Sync {
 pub struct Pager {
     cas: CasHandle,
     manifests: Arc<dyn ManifestStore>,
+    /// Decoded manifests, kept in memory.
+    ///
+    /// # Why this is safe, and why it is necessary
+    ///
+    /// Manifests are **immutable and content-addressed**, so a cached one can never be stale: a
+    /// different manifest is a different id. There is no invalidation protocol here because there is
+    /// nothing to invalidate.
+    ///
+    /// It is necessary because without it, every single page read deserialized an entire manifest
+    /// from bincode. On a 1 GiB database that is sixteen thousand entries, and the benchmark put a
+    /// number on it: **1.9 ms to read one page.** Reads are supposed to be the cheap thing.
+    ///
+    /// Shared across every fork of a store, because forks share history and therefore share the
+    /// manifests worth caching.
+    cache: Arc<Mutex<ManifestCache>>,
     head: Mutex<ManifestId>,
     config: StoreConfig,
     clock: Arc<dyn Clock>,
+}
+
+/// A bounded cache of decoded manifests.
+///
+/// Deliberately dumb: when it is full, it is cleared. A proper LRU would evict better, and would
+/// also be a second data structure to keep in step with the first — for a cache whose entries are
+/// all equally valid and cheap to rebuild, that complexity buys very little. (CLAUDE.md rule 10.)
+#[derive(Default)]
+struct ManifestCache {
+    entries: HashMap<ManifestId, Arc<Manifest>>,
+}
+
+impl ManifestCache {
+    /// Roughly 32 MiB of manifests for a 1 GiB database. Small enough not to matter, large enough
+    /// that an overlay chain and its base always fit.
+    const CAPACITY: usize = 2_048;
+
+    fn get(&self, id: &ManifestId) -> Option<Arc<Manifest>> {
+        self.entries.get(id).cloned()
+    }
+
+    fn insert(&mut self, id: ManifestId, manifest: Arc<Manifest>) {
+        if self.entries.len() >= Self::CAPACITY {
+            self.entries.clear();
+        }
+        self.entries.insert(id, manifest);
+    }
+
+    fn forget(&mut self, id: &ManifestId) {
+        self.entries.remove(id);
+    }
 }
 
 impl Pager {
@@ -298,6 +362,7 @@ impl Pager {
                 pins: Arc::new(PinRegistry::default()),
             },
             manifests,
+            cache: Arc::new(Mutex::new(ManifestCache::default())),
             head: Mutex::new(head),
             config,
             clock,
@@ -313,6 +378,8 @@ impl Pager {
         Ok(Pager {
             cas: self.cas.clone(),
             manifests: Arc::clone(&self.manifests),
+            // Forks share the cache. They share history, so they share the manifests worth caching.
+            cache: Arc::clone(&self.cache),
             head: Mutex::new(manifest),
             config: self.config.clone(),
             clock: Arc::clone(&self.clock),
@@ -331,14 +398,54 @@ impl Pager {
     pub fn derive_next(
         &self,
         base: ManifestId,
-        writes: &BTreeMap<LogicalPageNo, Option<PageId>>,
+        writes: &PageChanges,
         created_at_ms: u64,
     ) -> Result<Option<(Manifest, ManifestId)>> {
-        let base_manifest = self.manifests.get(base)?;
-        let next = base_manifest.derive(writes, base, created_at_ms);
-        if next.pages == base_manifest.pages {
+        let base_manifest = self.fetch(base)?;
+
+        // Look up ONLY the pages this transaction touches — O(changed × depth), with depth bounded
+        // at 8. Resolving the whole base here would cost O(pages), which is exactly the cost overlays
+        // exist to avoid, and doing it was measurably wrong: the benchmark showed a one-page commit
+        // to a 1 GiB database taking 3.7 ms and scaling with the database rather than the change.
+        let mut changes_anything = false;
+        let mut page_count = base_manifest.page_count as i64;
+
+        for (&page_no, &content) in writes {
+            let existing = self.lookup_page(base, page_no)?;
+            match (existing, content) {
+                (Some(old), Some(new)) if old == new => {} // rewriting identical bytes
+                (None, None) => {}                         // removing a page that is not there
+                (None, Some(_)) => {
+                    changes_anything = true;
+                    page_count += 1;
+                }
+                (Some(_), None) => {
+                    changes_anything = true;
+                    page_count -= 1;
+                }
+                _ => changes_anything = true,
+            }
+        }
+
+        // A transaction that rewrites the bytes already there changes nothing, and must not append a
+        // duplicate manifest to history. Otherwise an idempotent retry — a writer replaying the same
+        // batch after a timeout, which is NORMAL — grows the manifest DAG forever while the database
+        // stands still.
+        if !changes_anything {
             return Ok(None);
         }
+        let page_count = page_count.max(0) as u64;
+
+        // Flatten or overlay, decided purely by the base's depth so that replay reproduces the same
+        // choice (see manifest.rs). Only the flattening branch pays O(pages), and only one commit in
+        // MAX_OVERLAY_DEPTH takes it.
+        let next = if base_manifest.must_flatten() {
+            let resolved = self.resolve_manifest(base, &base_manifest)?;
+            Manifest::flatten_onto(base, &base_manifest, &resolved, writes, created_at_ms)
+        } else {
+            Manifest::overlay_on(base, &base_manifest, writes, page_count, created_at_ms)
+        };
+
         let id = next.id()?;
         Ok(Some((next, id)))
     }
@@ -349,6 +456,10 @@ impl Pager {
     /// Recovery leans on that hard.
     pub fn install(&self, manifest: &Manifest) -> Result<ManifestId> {
         let id = self.manifests.put(manifest)?;
+        self.cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, Arc::new(manifest.clone()));
         self.set_head(id);
         Ok(id)
     }
@@ -425,25 +536,142 @@ impl Pager {
             }
             // A root that does not exist is a caller error, not a reason to sweep everything.
             // Bailing out here is the conservative choice: we would rather retain garbage than
-            // collect something we simply failed to read.
-            let manifest = self.manifests.get(id)?;
+            // collect something we merely failed to read.
+            let manifest = self.fetch(id)?;
+
+            // The HISTORY edge. Parents are reachable because history is what makes rewind, diff,
+            // and audit possible.
             if let Some(parent) = manifest.parent {
                 stack.push(parent);
             }
+
+            // The STORAGE edge — and this one is not optional. An overlay manifest is *unreadable*
+            // without its base: the base holds the pages the overlay did not touch. Collecting a
+            // live manifest's overlay base would not lose history, it would lose the DATABASE.
+            //
+            // The two edges usually coincide, so it is very easy to write this loop following only
+            // `parent` and never notice. They come apart exactly at a collapse boundary, where a
+            // flattened manifest has a parent but no base — and at a rewind, where a head's parent
+            // chain and its overlay chain diverge.
+            if let Some(base) = manifest.overlay_base() {
+                stack.push(base);
+            }
         }
         Ok(seen)
+    }
+
+    /// Load a manifest, decoding it at most once.
+    fn fetch(&self, id: ManifestId) -> Result<Arc<Manifest>> {
+        if let Some(hit) = self
+            .cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+        {
+            return Ok(hit);
+        }
+        let manifest = Arc::new(self.manifests.get(id)?);
+        self.cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, Arc::clone(&manifest));
+        Ok(manifest)
+    }
+
+    /// Walk an overlay chain to a complete page map.
+    fn resolve_manifest(&self, id: ManifestId, manifest: &Manifest) -> Result<PageMap> {
+        // Collect the chain from this manifest down to the flat one at its base.
+        let mut chain: Vec<Arc<Manifest>> = Vec::new();
+        let mut current = Arc::new(manifest.clone());
+
+        loop {
+            match current.overlay_base() {
+                None => break, // flat: the bottom of the chain
+                Some(base) => {
+                    chain.push(current);
+                    current = self.fetch(base)?;
+                }
+            }
+            // Depth is bounded by construction (MAX_OVERLAY_DEPTH), but a corrupt or hostile
+            // manifest could claim otherwise, and an unbounded walk on untrusted input is how a
+            // storage engine becomes a denial of service against itself.
+            if chain.len() > MAX_OVERLAY_DEPTH as usize + 1 {
+                return Err(PagerError::MissingManifest(format!(
+                    "{id}: overlay chain exceeds the maximum depth of {MAX_OVERLAY_DEPTH}"
+                )));
+            }
+        }
+
+        let mut pages = current.flat_pages().cloned().unwrap_or_default();
+
+        // Apply the overlays from the bottom up — oldest change first, newest last, so the newest
+        // wins. Reversing this silently serves stale data.
+        for overlay in chain.iter().rev() {
+            if let Some(changes) = overlay.changes() {
+                for (&page_no, &content) in changes {
+                    match content {
+                        Some(page) => {
+                            pages.insert(page_no, page);
+                        }
+                        None => {
+                            pages.remove(&page_no);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(pages)
+    }
+
+    /// Resolve one page through the chain, without materialising the whole map.
+    fn lookup_page(&self, id: ManifestId, page_no: LogicalPageNo) -> Result<Option<PageId>> {
+        let mut current = self.fetch(id)?;
+        let mut hops = 0u32;
+
+        loop {
+            match current.local_lookup(page_no) {
+                // This manifest has an opinion: either the content, or a definite removal. Either
+                // way we stop. Continuing past a tombstone would resurrect the base's copy.
+                Some(answer) => return Ok(answer),
+                // It says nothing. Ask the base.
+                None => match current.overlay_base() {
+                    Some(base) => {
+                        hops += 1;
+                        if hops > MAX_OVERLAY_DEPTH + 1 {
+                            return Err(PagerError::MissingManifest(format!(
+                                "overlay chain exceeds the maximum depth of {MAX_OVERLAY_DEPTH}"
+                            )));
+                        }
+                        current = self.fetch(base)?;
+                    }
+                    // A flat manifest always has an opinion (`local_lookup` returns `Some`), so
+                    // reaching here means the chain ended without one. Nothing has the page.
+                    None => return Ok(None),
+                },
+            }
+        }
+    }
+
+    /// Every ancestor of a manifest in the commit DAG, including itself.
+    fn ancestors(&self, id: ManifestId) -> Result<Vec<ManifestId>> {
+        let mut out = Vec::new();
+        let mut current = Some(id);
+        while let Some(next) = current {
+            out.push(next);
+            current = self.fetch(next)?.parent;
+        }
+        Ok(out)
     }
 }
 
 impl PageStore for Pager {
     fn read(&self, manifest: &ManifestId, page_no: LogicalPageNo) -> Result<Page> {
-        let manifest_data = self.manifests.get(*manifest)?;
-        let page_id = manifest_data
-            .get(page_no)
-            .ok_or_else(|| PagerError::PageNotFound {
-                page_no,
-                manifest: manifest.to_hex(),
-            })?;
+        let page_id =
+            self.lookup_page(*manifest, page_no)?
+                .ok_or_else(|| PagerError::PageNotFound {
+                    page_no,
+                    manifest: manifest.to_hex(),
+                })?;
         self.cas.cas.get(page_id)
     }
 
@@ -482,31 +710,24 @@ impl PageStore for Pager {
     }
 
     fn commit(&self, txn: Txn) -> Result<ManifestId> {
-        // An empty transaction commits to the manifest it started from. It does not append a
-        // duplicate to history — content addressing would give it the same id anyway, but being
-        // explicit costs nothing and makes the intent legible.
+        // An empty transaction commits to the manifest it started from.
         if txn.writes.is_empty() {
             return Ok(txn.base);
         }
 
-        let base = self.manifests.get(txn.base)?;
-        let next = base.derive(&txn.writes, txn.base, self.clock.now_ms());
+        let Some((next, _)) = self.derive_next(txn.base, &txn.writes, self.clock.now_ms())? else {
+            return Ok(txn.base); // the transaction changes nothing
+        };
 
-        // A transaction that rewrites the bytes already there changes nothing, and must not
-        // append a duplicate manifest to history. Otherwise an idempotent retry — a writer
-        // replaying the same batch after a timeout, which is *normal* — grows the manifest DAG
-        // forever while the database stands still.
-        if next.pages == base.pages {
-            return Ok(txn.base);
-        }
-
-        // Step 2 of the commit protocol: the manifest is the commit record here. Once this
-        // returns, the transaction has happened. (substrate-wal turns this into a genuine
-        // fsync'd WAL record with an LSN; at the pager level, manifest durability *is* the
-        // commit point.)
+        // The manifest is the commit record at this level. (substrate-wal turns this into a genuine
+        // fsync'd WAL record with an LSN; at the pager alone, manifest durability IS the commit.)
         let id = self.manifests.put(&next)?;
+        self.cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, Arc::new(next));
 
-        // Step 3: now, and only now, is it visible to readers.
+        // Only now is it visible to readers.
         self.set_head(id);
         Ok(id)
     }
@@ -535,10 +756,7 @@ impl PageStore for Pager {
     }
 
     fn diff(&self, a: &ManifestId, b: &ManifestId) -> Result<PageDiff> {
-        Ok(PageDiff::between(
-            &self.manifests.get(*a)?,
-            &self.manifests.get(*b)?,
-        ))
+        Ok(PageDiff::between(&self.resolve(a)?, &self.resolve(b)?))
     }
 
     fn diff3(&self, base: &ManifestId, a: &ManifestId, b: &ManifestId) -> Result<ThreeWayDiff> {
@@ -546,9 +764,9 @@ impl PageStore for Pager {
             *base,
             *a,
             *b,
-            &self.manifests.get(*base)?,
-            &self.manifests.get(*a)?,
-            &self.manifests.get(*b)?,
+            &self.resolve(base)?,
+            &self.resolve(a)?,
+            &self.resolve(b)?,
         ))
     }
 
@@ -559,8 +777,10 @@ impl PageStore for Pager {
 
         let mut live_pages: HashSet<PageId> = HashSet::new();
         for id in &reachable {
-            let manifest = self.manifests.get(*id)?;
-            live_pages.extend(manifest.referenced_pages());
+            // Resolve, do not just read the local body: an overlay only names the pages it CHANGED.
+            // Treating an overlay's changes as its full page set would mark every untouched page of
+            // every branch as garbage, and GC would delete the database.
+            live_pages.extend(self.resolve(id)?.into_values());
         }
 
         // 2. Pages staged by in-flight transactions are roots too. They are durable and not yet
@@ -585,6 +805,12 @@ impl PageStore for Pager {
                 stats.manifests_retained += 1;
             } else {
                 self.manifests.remove(id)?;
+                // Evict it, or a later read would be served from a cache entry whose backing object
+                // we have just deleted — a use-after-free with extra steps.
+                self.cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .forget(&id);
                 stats.manifests_swept += 1;
             }
         }
@@ -593,6 +819,27 @@ impl PageStore for Pager {
 
     fn manifest(&self, id: &ManifestId) -> Result<Manifest> {
         self.manifests.get(*id)
+    }
+
+    fn resolve(&self, id: &ManifestId) -> Result<PageMap> {
+        let manifest = self.manifests.get(*id)?;
+        self.resolve_manifest(*id, &manifest)
+    }
+
+    fn lookup(&self, id: &ManifestId, page_no: LogicalPageNo) -> Result<Option<PageId>> {
+        self.lookup_page(*id, page_no)
+    }
+
+    fn merge_base(&self, a: &ManifestId, b: &ManifestId) -> Result<Option<ManifestId>> {
+        // Walk A's ancestry into a set, then walk B's upward until we hit it. The first hit is the
+        // most recent common ancestor, because we walk B newest-first.
+        let a_ancestors: HashSet<ManifestId> = self.ancestors(*a)?.into_iter().collect();
+        for candidate in self.ancestors(*b)? {
+            if a_ancestors.contains(&candidate) {
+                return Ok(Some(candidate));
+            }
+        }
+        Ok(None)
     }
 
     fn page_size(&self) -> usize {

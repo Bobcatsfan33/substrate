@@ -129,13 +129,13 @@ fn recover_and_check(
 
     // Read back everything the recovered store holds.
     let head = db.head();
-    let manifest = db
+    let pages = db
         .pager()
-        .manifest(&head)
+        .resolve(&head)
         .unwrap_or_else(|e| panic!("{scenario}: recovered head is unreadable: {e}"));
 
     let mut actual = ExpectedState::new();
-    for page_no in manifest.pages.keys() {
+    for page_no in pages.keys() {
         let page = db.read(&head, *page_no).unwrap_or_else(|e| {
             panic!("{scenario}: page {page_no} of the recovered head is unreadable — a committed page was lost: {e}")
         });
@@ -265,9 +265,9 @@ fn crashes_against_a_real_disk_never_lose_a_commit() {
             .unwrap_or_else(|e| panic!("seed={seed}: recovery: {e}"));
 
         let head = db.head();
-        let manifest = db.pager().manifest(&head).expect("head readable");
+        let pages = db.pager().resolve(&head).expect("head readable");
         let mut actual = ExpectedState::new();
-        for page_no in manifest.pages.keys() {
+        for page_no in pages.keys() {
             actual.insert(
                 *page_no,
                 db.read(&head, *page_no)

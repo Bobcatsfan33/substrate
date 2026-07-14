@@ -447,18 +447,44 @@ The export path is tested in CI on every commit. It is not allowed to rot.
 ## §7 — Performance targets
 
 Numbers we hold ourselves to. A regression against any of these is a release blocker, not a
-follow-up ticket.
+follow-up ticket. Every one has a benchmark in the repository (`crates/substrate-pager/benches/`),
+and the measured column is what that benchmark reports today, on a laptop, in memory.
 
-| Operation | Target | Why this number |
-| --- | --- | --- |
-| Fork a database | **< 1 ms** | Must be cheap enough to do per-request without thinking. |
-| Snapshot | **< 1 ms** | Same. Pre-migration snapshots must be free enough to take unconditionally. |
-| Wake from object storage (p99, first row) | **< 250 ms** | The line between "hibernation" and "restore job". Above this, sleeping stops being invisible. |
-| Overlay-chain read overhead at depth 8 vs flat | **< 20 %** | Deep branch trees must stay usable, or the collapse threshold is load-bearing rather than an optimisation. |
-| TPC-H SF0.1 through the stack vs raw DuckDB | **< 15 % overhead** | Our storage layer must not make the query engine we host look bad. |
-| Fan-out pruning, selective predicate | **> 95 % of fleet pruned** | Fan-out that touches every database is just a slow full scan. |
+| Operation | Target | Measured | Why this number |
+| --- | --- | --- | --- |
+| Fork a database | **< 1 ms** | **98 ns**, flat from 100 to 16,384 pages | Must be cheap enough to do per-request without thinking. It is O(1), and the benchmark proves it by not moving as the database grows 160×. |
+| Snapshot | **< 1 ms** | **15 ns** | Same. Pre-migration snapshots must be free enough to take unconditionally, for all ten thousand databases. |
+| Read one page, overlay depth 8 vs flat | **< 20 % overhead** | **+1.4 %** (35.3 µs vs 34.8 µs, 64 KiB pages) | Deep branch trees must stay usable, or the collapse threshold is load-bearing rather than an optimisation. |
+| Commit one page to a 1 GiB database | scales with the *change*, not the database | **577 µs** | See §7.1 — this is what overlay manifests bought. |
+| Three-way diff, 1 GiB logical, 16 changed pages | scales with *changed* | **7.4 ms** | Merge must be tractable on a real database, and its cost must follow what moved, not what exists. |
+| Wake from object storage (p99, first row) | **< 250 ms** | measured against MinIO (`substrate-store`) | The line between "hibernation" and "restore job". Above this, sleeping stops being invisible. |
+| TPC-H SF0.1 through the stack | **< 15 % overhead** | *(F1)* | Our storage layer must not make the query engine we host look bad. |
+| Fan-out pruning, selective predicate | **> 95 % of fleet pruned** | *(F5)* | Fan-out that touches every database is just a slow full scan. |
 
----
+### §7.1 — Two things the benchmarks caught, written down so nobody rediscovers them
+
+**A read used to cost 1.9 ms.** Every page read deserialized the entire manifest from its on-disk
+encoding — sixteen thousand entries, to look up one of them. The fix is a cache of decoded manifests,
+which is *trivially* safe here: manifests are immutable and content-addressed, so a cached one can
+never be stale. There is no invalidation protocol because there is nothing to invalidate. Reads went
+from **1.9 ms to 180 ns**.
+
+**A one-page commit used to cost 3.7 ms and scale with the database.** The commit path resolved the
+entire base manifest — O(pages) — to decide what had changed. That is exactly the cost overlay
+manifests exist to *avoid*, so the whole scheme was paying for itself and delivering nothing. The fix
+is to look up only the pages the transaction actually touches (O(changed × depth), depth bounded at
+8), and resolve the full base **only** when the chain is collapsing — one commit in eight.
+
+**And the honest caveat on the < 20 % target.** Resolving a page through 8 overlays really is about
+**6× more manifest work** than a flat lookup (312 ns vs 51 ns). Measured *in isolation*, the overlay
+chain misses the 20 % target badly. It passes end-to-end — by a wide margin — because a page read is
+a manifest lookup **plus fetching 64 KiB of bytes**, and 260 ns of extra pointer-chasing against a
+35 µs fetch is 0.9 % of the work.
+
+An earlier version of this benchmark reported the overhead as *0.6 %* — and it was lying, because
+both cases were drowning in the deserialization cost above. Fixing the real bug is what exposed the
+real ratio. We record both numbers here, permanently, so that the next person who raises
+`MAX_OVERLAY_DEPTH` knows precisely what they are spending.
 
 ## §8 — Isolation
 
