@@ -118,7 +118,9 @@ The benchmarks caught two real performance bugs the moment they existed: every p
 
 - **P5** — hardening. Integrity scrubbing (finds bit rot in pages *nobody has read*), repair-from-object-storage that **verifies the replica before installing it**, trait-based metrics hooks with no library dependency, and the frozen v1.0 API surface.
 
-Next: encryption and offline licensing (P6).
+- **P6** `substrate-security` — page encryption (XChaCha20-Poly1305, pool→database key hierarchy) and offline licensing (Ed25519, ML-DSA-ready).
+
+**Substrate is feature-complete.** Next: FlockDB and LoomDB, which build on this.
 
 Not yet: SQL (that's FlockDB), agents (that's LoomDB). **The API is now stable — build on it.**
 
@@ -129,6 +131,7 @@ crates/
   substrate-pager/     pages, CAS, manifests, branch trees, GC     (sync — no async, ever)
   substrate-wal/       segments, commit protocol, recovery         (sync)
   substrate-store/     object storage, tiering, sleep/wake         (async, tokio)
+  substrate-security/  encryption at rest, offline licensing
 testing/
   fuzz/                cargo-fuzz targets + crash injection
   integration/         cross-crate lifecycle tests
@@ -150,7 +153,9 @@ cargo +nightly fuzz run --fuzz-dir testing/fuzz pager_ops   # the oracle, hostil
 1. [`docs/04`](docs/04-flockdb-loomdb-unified-roadmap.md) — why one engine and two products
 2. [`docs/02`](docs/02-embedded-single-node-engine-architecture.md) — the engine and the fleet plane (FlockDB)
 3. [`docs/03`](docs/03-agent-native-database-architecture.md) — branch/merge, provenance, taint-and-recall (LoomDB)
-4. [`CLAUDE.md`](CLAUDE.md) — the rules, and the reason for each
+4. [`docs/substrate-api.md`](docs/substrate-api.md) — the frozen v1.0 surface and the compatibility promise
+5. [`docs/threat-model.md`](docs/threat-model.md) — what we defend, and **what we don't**
+6. [`CLAUDE.md`](CLAUDE.md) — the rules, and the reason for each
 
 ## License
 

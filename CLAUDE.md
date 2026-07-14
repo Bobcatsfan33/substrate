@@ -130,7 +130,7 @@ crates/
   substrate-pager/     pages, CAS, manifests, branch trees, GC     (sync, no deps on wal/store)
   substrate-wal/       segments, commit protocol, recovery         (sync)
   substrate-store/     object storage, tiering, sleep/wake         (async, tokio)
-  substrate-security/  page encryption, offline licensing          (P6)
+  substrate-security/  page encryption, offline licensing          (XChaCha20 + Ed25519)
 testing/
   fuzz/                cargo-fuzz targets + crash injection
   integration/         cross-crate lifecycle tests

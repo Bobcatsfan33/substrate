@@ -110,7 +110,7 @@ jobs:
             -e CARGO_HOME=/w/.cargo-home \
             rust:1-slim \
             cargo test --workspace --offline \
-              --features substrate-pager/airgap,substrate-wal/airgap,substrate-pager/test-util
+              --features substrate-pager/airgap,substrate-wal/airgap,substrate-store/airgap,substrate-security/airgap,substrate-pager/test-util
 
   deny:
     name: cargo-deny

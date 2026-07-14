@@ -1,0 +1,29 @@
+[package]
+name = "substrate-security"
+description = "Page encryption at rest and offline licensing for substrate."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["encryption", "licensing", "xchacha20", "ed25519"]
+categories = ["cryptography", "database-implementations"]
+
+[dependencies]
+substrate-pager.workspace = true
+blake3.workspace = true
+thiserror.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+chacha20poly1305 = "0.10"
+ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+zeroize = { version = "1", features = ["zeroize_derive"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[features]
+default = []
+airgap = ["substrate-pager/airgap"]
+keyed-hash = ["substrate-pager/keyed-hash"]

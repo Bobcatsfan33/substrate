@@ -36,6 +36,37 @@ pub trait Cas: Send + Sync {
 
     /// Every page currently stored. GC sweeps the difference between this and the live set.
     fn list(&self) -> Result<Vec<PageId>>;
+
+    /// Store bytes at an id **without** requiring that they hash to it.
+    ///
+    /// # Why this exists, and why it is not a hole in the integrity story
+    ///
+    /// `substrate-security` encrypts pages, and **ciphertext does not hash to the plaintext's id** —
+    /// that is the whole design (identity is computed on the plaintext so that content addressing and
+    /// deduplication survive encryption; see docs/02 §9.1). So the encrypting layer needs a way to
+    /// store bytes whose hash is deliberately not their key.
+    ///
+    /// Integrity does not go away; it moves. An encrypted page is protected by the **AEAD tag**, which
+    /// is strictly stronger than a hash check: it proves the bytes are authentic, were encrypted under
+    /// the right key, and were stored at the right address. The plaintext hash is then verified *as
+    /// well*, after decryption, because the cost is one BLAKE3.
+    ///
+    /// Default implementations return an error, so this is additive for anyone who has implemented
+    /// `Cas` and does not need it.
+    fn put_raw(&self, id: PageId, bytes: &[u8]) -> Result<()> {
+        let _ = (id, bytes);
+        Err(PagerError::backend(
+            "this content-addressed store does not support raw (unverified) writes",
+        ))
+    }
+
+    /// Retrieve bytes **without** verifying that they hash to `id`. See [`Cas::put_raw`].
+    fn get_raw(&self, id: PageId) -> Result<Vec<u8>> {
+        let _ = id;
+        Err(PagerError::backend(
+            "this content-addressed store does not support raw (unverified) reads",
+        ))
+    }
 }
 
 /// Pages that must not be collected even though no manifest references them yet.
@@ -243,6 +274,18 @@ impl Cas for MemCas {
     fn remove(&self, id: PageId) -> Result<()> {
         self.lock()?.remove(&id);
         Ok(())
+    }
+
+    fn put_raw(&self, id: PageId, bytes: &[u8]) -> Result<()> {
+        self.lock()?.insert(id, bytes.to_vec());
+        Ok(())
+    }
+
+    fn get_raw(&self, id: PageId) -> Result<Vec<u8>> {
+        self.lock()?
+            .get(&id)
+            .cloned()
+            .ok_or(PagerError::MissingPage(id))
     }
 
     fn list(&self) -> Result<Vec<PageId>> {

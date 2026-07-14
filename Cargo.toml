@@ -5,6 +5,7 @@ members = [
     "crates/substrate-pager",
     "crates/substrate-wal",
     "crates/substrate-store",
+    "crates/substrate-security",
     "testing/integration",
 ]
 
@@ -22,6 +23,7 @@ authors = ["Substrate Contributors"]
 substrate-pager = { path = "crates/substrate-pager", version = "0.1.0" }
 substrate-wal = { path = "crates/substrate-wal", version = "0.1.0" }
 substrate-store = { path = "crates/substrate-store", version = "0.1.0" }
+substrate-security = { path = "crates/substrate-security", version = "0.1.0" }
 
 # --- core (sync, no runtime) ---
 blake3 = "1.5"
