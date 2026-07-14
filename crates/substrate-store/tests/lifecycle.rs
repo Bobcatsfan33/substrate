@@ -81,11 +81,11 @@ async fn write_sleep_wipe_wake_read() -> Result<()> {
     let started = Instant::now();
     let db = TieredStore::wake(new_home.path(), remote, &token).await?;
 
-    let first_read = {
+    let (first_read, misses_after_first_read) = {
         let page = db.pager().read_head(0)?;
         let elapsed = started.elapsed();
         assert_eq!(page.as_bytes(), expected[0].1.as_slice());
-        elapsed
+        (elapsed, db.stats().misses)
     };
 
     // Every page comes back, byte for byte.
@@ -97,16 +97,27 @@ async fn write_sleep_wipe_wake_read() -> Result<()> {
         );
     }
 
-    // The target is p99 < 250 ms against MinIO on localhost (docs/02 §7). Against an in-memory
-    // backend this is microseconds, so the assertion here is deliberately loose — it is a guard
-    // against a catastrophic regression (say, someone making wake() fetch every page eagerly),
-    // not a benchmark. The real number is measured in `benches/`.
-    assert!(
-        first_read.as_millis() < 250,
-        "wake-to-first-read took {first_read:?}, which is over the 250ms budget even in memory"
+    // **The property, asserted structurally rather than on a stopwatch.**
+    //
+    // What makes wake fast is that it is LAZY: it fetches the manifest, and then only the pages a
+    // query actually touches. The regression this guards against is someone making wake() fetch
+    // everything eagerly — and the honest way to detect that is to count the fetches, not to time
+    // them.
+    //
+    // An earlier version asserted `elapsed < 250ms` against an IN-MEMORY object store. That measures
+    // how busy the CI runner is, and it duly went red under parallel load while the engine was
+    // perfectly correct. A test whose result depends on machine speed will eventually lie to you, in
+    // both directions. The real 250 ms figure (docs/02 §7) belongs against MinIO, over a real
+    // network, where the number means something — see `minio_round_trip`.
+    assert_eq!(
+        misses_after_first_read, 1,
+        "reading ONE page after waking fetched {misses_after_first_read} pages. Wake is supposed to \
+         be lazy; if it fetches eagerly, waking a 100 GB database moves 100 GB and the entire \
+         economic argument for sleeping goes with it."
     );
+    let _ = first_read; // kept for the operator-facing log line, not asserted on
 
-    // Waking must NOT have dragged the whole database down with it. Only the pages we read.
+    // And by the end, we have fetched only what we read — not the whole database.
     let stats = db.stats();
     assert!(
         stats.misses <= expected.len() as u64,

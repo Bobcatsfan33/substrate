@@ -154,7 +154,25 @@ impl ManifestStore for TieredManifestStore {
         if self.local.contains(id)? {
             return Ok(true);
         }
-        Ok(self.durable().contains(&id))
+        if self.durable().contains(&id) {
+            return Ok(true);
+        }
+
+        // Ask object storage. This matters more than it looks: `Pager::at` — which is what `fork()`
+        // and every "open at this commit" call goes through — checks `contains` before it will touch
+        // a manifest. A `contains` that only knows about the local disk reports "missing" for every
+        // manifest of a database that has just WOKEN, and the woken database refuses to open itself.
+        //
+        // A HEAD request is cheap. Being unable to open a database you just restored is not.
+        let key = self.remote.manifest_key(id);
+        let exists = self
+            .block(async { self.remote.exists(&key).await })
+            .map_err(PagerError::backend)?;
+
+        if exists {
+            self.durable().insert(id);
+        }
+        Ok(exists)
     }
 
     fn remove(&self, id: ManifestId) -> PagerResult<()> {
