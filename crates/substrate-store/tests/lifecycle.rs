@@ -561,3 +561,86 @@ async fn a_page_damaged_in_both_tiers_is_reported_lost_not_quietly_installed() -
     assert!(pager.read(&head, 0).is_err_and(|e| e.is_corruption()));
     Ok(())
 }
+
+/// **Waking a database whose head is an OVERLAY must work.**
+///
+/// This is the test that was missing, and its absence hid a real bug.
+///
+/// `sleep()` uploaded exactly one manifest: the head. That was correct in P3, when every manifest was
+/// self-contained. P4 introduced **overlay manifests** — a manifest that records only what *changed*
+/// and defers everything else to its base — and nobody went back and asked what that does to sleep.
+///
+/// It breaks it. An overlay without its base cannot resolve the pages it did not touch. So a woken
+/// database could read any page the top overlay happened to hold, and would fail on every other one.
+///
+/// The existing lifecycle test did not catch it, because it wrote every page in a single commit — so
+/// every page *was* in the top overlay, and the walk never needed the base. A test that only ever
+/// exercises the easy path is a test that reports green while proving nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_database_whose_head_is_an_overlay_wakes_correctly() -> Result<()> {
+    let backend = Arc::new(InMemory::new());
+    let remote = RemoteTier::new(backend, "acme");
+    let first_home = tempfile::tempdir().expect("tempdir");
+
+    let token = {
+        let db = TieredStore::open(first_home.path(), remote.clone(), config("acme")).await?;
+        let pager = db.pager();
+
+        // A flat base with many pages...
+        let mut txn = pager.begin()?;
+        for page_no in 0..64u64 {
+            pager.write(&mut txn, page_no, content(page_no as u8, 200))?;
+        }
+        pager.commit(txn)?;
+
+        // ...and then a CHAIN of small commits on top, each touching one page. The head is now an
+        // overlay that knows about page 0 and nothing else.
+        for round in 0..4u64 {
+            let mut txn = pager.begin()?;
+            pager.write(&mut txn, round, content(200 + round as u8, 50))?;
+            pager.commit(txn)?;
+        }
+
+        let head = pager.manifest(&pager.head())?;
+        assert!(
+            !head.is_flat(),
+            "this test is pointless unless the head is an overlay"
+        );
+        assert!(head.depth() > 1, "and it needs a chain worth losing");
+
+        db.sleep().await?
+    };
+
+    // Destroy the local disk. Everything the database needs must now be in object storage.
+    std::fs::remove_dir_all(first_home.path()).expect("wipe the machine");
+
+    let new_home = tempfile::tempdir().expect("tempdir");
+    let db = TieredStore::wake(new_home.path(), remote, &token).await?;
+
+    // A page the TOP OVERLAY DOES NOT HOLD. Resolving it must walk down the chain to the flat base —
+    // which is a different manifest, and which had better be in object storage too.
+    let cold = db.pager().read_head(42)?;
+    assert_eq!(
+        cold.as_bytes(),
+        content(42, 200).as_slice(),
+        "a page not held by the top overlay could not be read after waking — sleep() uploaded the \
+         head manifest but not the base it depends on, so the woken database is missing most of \
+         itself"
+    );
+
+    // And every other page, including the ones the overlays did rewrite.
+    for page_no in 4..64u64 {
+        assert_eq!(
+            db.pager().read_head(page_no)?.as_bytes(),
+            content(page_no as u8, 200).as_slice(),
+            "page {page_no} did not survive sleep and wake"
+        );
+    }
+    for round in 0..4u64 {
+        assert_eq!(
+            db.pager().read_head(round)?.as_bytes(),
+            content(200 + round as u8, 50).as_slice()
+        );
+    }
+    Ok(())
+}

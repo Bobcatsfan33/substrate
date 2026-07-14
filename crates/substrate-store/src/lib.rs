@@ -52,10 +52,12 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 mod error;
+mod manifests;
 mod remote;
 pub mod tier;
 
 pub use error::{Result, StoreError};
+pub use manifests::TieredManifestStore;
 pub use remote::RemoteTier;
 pub use tier::{TierStats, TieredCas};
 
@@ -63,8 +65,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use substrate_pager::{
-    std_vfs, Cas, FsCas, FsManifestStore, Manifest, ManifestId, ManifestStore, PageStore, Pager,
-    StoreConfig,
+    std_vfs, Cas, FsCas, Manifest, ManifestId, ManifestStore, PageStore, Pager, StoreConfig,
 };
 
 /// Everything you need to bring a sleeping database back.
@@ -109,7 +110,7 @@ impl WakeToken {
 pub struct TieredStore {
     pager: Arc<Pager>,
     cas: Arc<TieredCas>,
-    manifests: Arc<dyn ManifestStore>,
+    manifests: Arc<TieredManifestStore>,
     remote: RemoteTier,
     root: PathBuf,
     config: StoreConfig,
@@ -135,12 +136,14 @@ impl TieredStore {
         let cas = TieredCas::new(local, remote.clone(), config.hasher.clone())?;
         tokio::spawn(Arc::clone(&cas).upload_loop());
 
-        let manifests: Arc<dyn ManifestStore> =
-            Arc::new(FsManifestStore::open_with_vfs(vfs, &root)?);
+        // Manifests tier too, and they MUST — an overlay manifest is unreadable without its base,
+        // and P4 made overlays the normal case. See `manifests.rs`.
+        let local_manifests = manifests::local_manifests(vfs, &root)?;
+        let manifests = TieredManifestStore::new(local_manifests, remote.clone())?;
 
         let pager = Arc::new(Pager::from_parts(
             Arc::clone(&cas) as Arc<dyn Cas>,
-            Arc::clone(&manifests),
+            Arc::clone(&manifests) as Arc<dyn ManifestStore>,
             config.clone(),
         )?);
 
@@ -187,11 +190,16 @@ impl TieredStore {
         //    here with the database intact and awake.
         self.cas.flush().await?;
 
-        // 2. The manifest follows the pages, never precedes them. A manifest in object storage
-        //    referencing pages that are not there yet is a database that wakes up broken.
-        let manifest = self.manifests.get(head)?;
-        let key = self.remote.manifest_key(head);
-        self.remote.put(&key, manifest.encode()?).await?;
+        // 2. The manifests follow the pages, never precede them. A manifest in object storage that
+        //    references pages that are not there yet is a database that wakes up broken.
+        //
+        //    And it is manifestS, plural. The head alone is not enough: an OVERLAY manifest cannot
+        //    resolve the pages it did not touch without its base, and P4 made overlays the normal
+        //    case. Uploading only the head — which is what this used to do — produced a woken
+        //    database that could read whatever the top overlay happened to hold and nothing else.
+        //    We upload the head's whole ancestry: the storage edge (so it can be read) and the
+        //    history edge (so its past survives).
+        self.manifests.upload_closure(head).await?;
 
         // 3. Only now is it safe to throw the local copy away. `drop_local` re-checks that nothing
         //    is un-uploaded and refuses if anything is — belt and braces, because this is the one
@@ -227,6 +235,11 @@ impl TieredStore {
         };
         let store = TieredStore::open(root, remote, config).await?;
 
+        // Eagerly: the head manifest. One round trip, and nothing can be read without it.
+        //
+        // Everything BEHIND it — the overlay chain it resolves through, and the parents that are its
+        // history — arrives on demand through the manifest tier. That is what keeps waking a 100 GB
+        // database from moving 100 GB.
         let key = store.remote.manifest_key(token.manifest);
         let bytes = store
             .remote
@@ -239,6 +252,25 @@ impl TieredStore {
         store.pager.set_head_to(token.manifest)?;
 
         Ok(store)
+    }
+
+    /// Make several heads durable in object storage — pages **and** the full manifest ancestry of
+    /// each.
+    ///
+    /// `sleep()` handles one head, which is all a single database has. **LoomDB has many**: every
+    /// branch is a head, and putting a tenant to sleep must not quietly drop the branches nobody
+    /// happened to be looking at.
+    pub async fn ensure_durable(&self, heads: &[ManifestId]) -> Result<()> {
+        self.cas.flush().await?;
+        for head in heads {
+            self.manifests.upload_closure(*head).await?;
+        }
+        Ok(())
+    }
+
+    /// Drop every locally cached page. Only legal once everything is durable remotely.
+    pub fn drop_local(&self) -> Result<()> {
+        self.cas.drop_local()
     }
 
     /// Where the local cache lives.
