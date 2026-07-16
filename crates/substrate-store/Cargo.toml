@@ -29,5 +29,12 @@ async-trait.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 
 [features]
-default = []
+# `remote` is on by default so existing consumers keep the S3 client. It is the ONLY thing that pulls
+# a network backend into object_store; building `--no-default-features` compiles the tiering code over
+# only the in-memory / local backends, with no outbound-networking client anywhere in the binary — the
+# compile-time amputation CLAUDE.md rule 5 requires, now real rather than a marker. The airgap posture
+# is therefore `--no-default-features` (Cargo features are additive and cannot *remove* `remote`); the
+# `airgap` marker below names it for docs and downstream feature-forwarding.
+default = ["remote"]
+remote = ["object_store/aws"]
 airgap = ["substrate-pager/airgap", "substrate-wal/airgap"]

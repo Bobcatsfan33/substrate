@@ -102,6 +102,23 @@ jobs:
           cargo vendor vendor > vendor-config.toml
           cat vendor-config.toml >> .cargo/config.toml
 
+      # The amputation, proven by inspecting the artifact (rule 5): with substrate-store built
+      # `--no-default-features`, object_store carries NO cloud backend — no aws/gcp/azure/http client is
+      # compiled in. This is the real removal, not the marker: the `remote` feature (on by default) is
+      # the only thing that pulls the S3 client, and it is absent here.
+      - name: Prove the airgap build links no object-storage network client
+        run: |
+          set -euo pipefail
+          echo "substrate-store airgap object_store features:"
+          cargo tree -p substrate-store --no-default-features -e features -i object_store || true
+          if cargo tree -p substrate-store --no-default-features -e features -i object_store \
+               | grep -iE 'feature "(aws|gcp|azure|http|cloud)"'; then
+            echo "::error::airgap amputation FAILED — object_store still has a cloud/network backend under --no-default-features."
+            exit 1
+          fi
+          cargo build -p substrate-store --no-default-features
+          echo "OK: the air-gap build of substrate-store has no object-storage network client."
+
       - name: Run the suite with no network namespace at all
         run: |
           docker run --rm --network none \

@@ -406,6 +406,10 @@ async fn corruption_in_object_storage_is_caught_on_the_way_in() -> Result<()> {
 ///     -e MINIO_ROOT_PASSWORD=minioadmin minio/minio server /data
 /// MINIO_URL=http://localhost:9000 cargo test -p substrate-store -- --ignored
 /// ```
+// Uses the S3 (`aws`) client directly, so it is compiled only with the `remote` feature (on by
+// default). An air-gap build (`--no-default-features`) has no S3 client — there is nothing here to
+// build — which is the whole point of the amputation.
+#[cfg(feature = "remote")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires a running MinIO; CI is deliberately network-isolated"]
 async fn minio_round_trip() -> Result<()> {

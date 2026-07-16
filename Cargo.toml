@@ -36,7 +36,13 @@ tempfile = "3"
 
 # --- async, store layer only (doc 02 §5.1: no async in pager/wal) ---
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync", "time"] }
-object_store = { version = "0.11", features = ["aws"] }
+# NO cloud backend in the shared default (rule 5: airgap removes outbound networking at COMPILE time).
+# `default-features = false` keeps the always-available in-memory / local-filesystem backends and drops
+# the S3/GCS/Azure clients. substrate-store re-enables the S3 (`aws`) client behind its own `remote`
+# feature (on by default, for compatibility); an air-gap build (`--no-default-features`) compiles no
+# network client at all. The tiering code is backend-agnostic (`Arc<dyn ObjectStore>`), so this is a
+# dependency-feature change with no code change.
+object_store = { version = "0.11", default-features = false }
 bytes = "1"
 futures = "0.3"
 async-trait = "0.1"
