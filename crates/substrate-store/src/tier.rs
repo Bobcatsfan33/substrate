@@ -45,7 +45,18 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use substrate_pager::{Cas, Page, PageHasher, PageId, PagerError, Result as PagerResult};
 use tokio::runtime::Handle;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
+
+/// The most object-storage GETs a single [`TieredCas::get_batch`] keeps in flight at once.
+///
+/// Coalescing here is **dedupe-by-object**, not ranging — a content-addressed store keys one object per
+/// page, so distinct pages are distinct objects with nothing between them to range over. The win is
+/// overlapping the distinct objects' round-trips over one pooled, keep-alive client instead of paying
+/// them one at a time. Bounded because across a wide-area link a *burst* of fresh connections contends
+/// more than it parallelises (the sibling engine measured a per-page fan-out lose to serial for exactly
+/// this reason). This width, paired with connection reuse, is the knob the wide-area harnesses
+/// calibrate; 16 is the correctness-phase default, not a tuned latency figure.
+const BATCH_FETCH_WIDTH: usize = 16;
 
 /// What the tier knows about every page it has seen.
 #[derive(Default)]
@@ -133,6 +144,107 @@ impl TieredCas {
     /// The pool this store belongs to.
     pub fn pool(&self) -> &str {
         self.remote.pool()
+    }
+
+    /// **Fetch many pages at once, coalescing the object-storage GETs.**
+    ///
+    /// Returns the pages in the same order as `ids`, each **byte-identical** to what [`Cas::get`] would
+    /// return for that id — the differential oracle (`tests/batch_fetch.rs`) proves this for arbitrary
+    /// sets. Pages already in the local cache are served from it; the rest are **deduplicated to their
+    /// distinct backing objects** (one content-hashed object per page, so identical pages share a single
+    /// GET) and fetched **concurrently** across those objects over the tier's one pooled, keep-alive
+    /// client, each hash-verified on arrival exactly as the single-page path verifies it.
+    ///
+    /// The win over N serial [`Cas::get`] calls is that the distinct objects' round-trips overlap in
+    /// time. Width is bounded by [`BATCH_FETCH_WIDTH`]; there is no *ranging* and no over-fetch, because
+    /// a content-addressed store has no intervening pages between two objects.
+    ///
+    /// **All-or-nothing.** If any object cannot be fetched — a failed GET, a missing object, or bytes
+    /// whose hash does not match the id — the whole call returns `Err`, nothing is written to the cache
+    /// for objects not proven good, and **no partial set is ever returned as success**. A torn batch
+    /// must never masquerade as a complete one — the same rule the single-page path holds.
+    pub fn get_batch(&self, ids: &[PageId]) -> PagerResult<Vec<Page>> {
+        // 1. Serve local hits; collect the DISTINCT missing objects (dedupe by content id).
+        let mut resolved: HashMap<PageId, Page> = HashMap::new();
+        let mut to_fetch: Vec<PageId> = Vec::new();
+        let mut seen: HashSet<PageId> = HashSet::new();
+        for &id in ids {
+            if !seen.insert(id) {
+                continue; // a duplicate id resolves to the same page — one GET, not two
+            }
+            match self.local.get(id) {
+                Ok(page) => {
+                    self.touch(id, page.len() as u64);
+                    self.stats_mut().hits += 1;
+                    resolved.insert(id, page);
+                }
+                Err(PagerError::MissingPage(_)) => to_fetch.push(id),
+                Err(e) => return Err(e),
+            }
+        }
+
+        // 2. Fetch the distinct missing objects concurrently, bounded width, over the pooled client.
+        if !to_fetch.is_empty() {
+            self.stats_mut().misses += to_fetch.len() as u64;
+            let remote = &self.remote;
+            let sem = Arc::new(Semaphore::new(BATCH_FETCH_WIDTH));
+            let fetched: Vec<(PageId, Vec<u8>)> = self.block(async {
+                let pending = to_fetch.iter().map(|&id| {
+                    let sem = Arc::clone(&sem);
+                    let key = remote.page_key(id);
+                    async move {
+                        // Bound concurrency. A closed semaphore cannot happen here (we own it), so a
+                        // failed acquire proceeds unbounded rather than panicking (rule 6).
+                        let _permit = sem.acquire_owned().await.ok();
+                        match remote.get(&key).await {
+                            Ok(Some(bytes)) => Ok((id, bytes)),
+                            // Neither tier has it — same meaning as the single-page path's `None`.
+                            Ok(None) => Err(PagerError::MissingPage(id)),
+                            Err(e) => Err(PagerError::backend(e)),
+                        }
+                    }
+                });
+                // Short-circuits on the first error and drops the rest, so a failed or missing object
+                // aborts the batch before anything is written to the cache.
+                futures::future::try_join_all(pending).await
+            })?;
+
+            // 3. Verify EVERY object before filling ANY — a corrupt page fails the whole batch with the
+            //    cache untouched, so a partial fill can never be mistaken for a complete one.
+            let mut verified: Vec<(PageId, Page)> = Vec::with_capacity(fetched.len());
+            for (id, bytes) in fetched {
+                let page = Page::new(&self.hasher, bytes, usize::MAX)?;
+                if page.id() != id {
+                    return Err(PagerError::CorruptPage {
+                        expected: id,
+                        actual: page.id(),
+                        len: page.len(),
+                    });
+                }
+                verified.push((id, page));
+            }
+            for (id, page) in verified {
+                self.local.put(&page)?;
+                {
+                    let mut state = self.state();
+                    state.durable.insert(id);
+                    state.pending.remove(&id);
+                }
+                self.touch(id, page.len() as u64);
+                resolved.insert(id, page);
+            }
+        }
+
+        // 4. Return the pages in the caller's order (duplicates resolve to the same page).
+        let mut out = Vec::with_capacity(ids.len());
+        for &id in ids {
+            match resolved.get(&id) {
+                Some(page) => out.push(page.clone()),
+                // Unreachable: every id was a local hit or in to_fetch, and to_fetch all resolved.
+                None => return Err(PagerError::MissingPage(id)),
+            }
+        }
+        Ok(out)
     }
 
     /// Enter the runtime from synchronous code.

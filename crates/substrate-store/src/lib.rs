@@ -65,7 +65,8 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use substrate_pager::{
-    std_vfs, Cas, FsCas, Manifest, ManifestId, ManifestStore, PageStore, Pager, StoreConfig,
+    std_vfs, Cas, FsCas, Manifest, ManifestId, ManifestStore, Page, PageId, PageStore, Pager,
+    Result as PagerResult, StoreConfig,
 };
 
 /// Everything you need to bring a sleeping database back.
@@ -165,6 +166,16 @@ impl TieredStore {
     /// Cache statistics.
     pub fn stats(&self) -> TierStats {
         self.cas.stats()
+    }
+
+    /// **Fetch many pages at once, coalescing the object-storage GETs** — see [`TieredCas::get_batch`].
+    ///
+    /// A product maps its own fault set to page ids (from a manifest closure, a learned warm set, the
+    /// pages a query touches) and calls this to warm them in one concurrent, deduplicated batch instead
+    /// of a series of single-page faults. Byte-identical to N serial [`PageStore::read`]s, all-or-nothing.
+    /// The single-page path is unchanged; this is purely additive.
+    pub fn get_batch(&self, ids: &[PageId]) -> PagerResult<Vec<Page>> {
+        self.cas.get_batch(ids)
     }
 
     /// Trim the local cache to a byte budget. Only durable pages are evicted.
