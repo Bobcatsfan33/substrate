@@ -25,12 +25,13 @@
 
 use crate::error::{Result, StoreError};
 use crate::remote::RemoteTier;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use substrate_pager::{
     Manifest, ManifestId, ManifestStore, PagerError, Result as PagerResult, Vfs,
 };
 use tokio::runtime::Handle;
+use tokio::sync::Semaphore;
 
 /// A local manifest store backed by object storage.
 ///
@@ -109,6 +110,90 @@ impl TieredManifestStore {
     /// How many manifests are known durable remotely.
     pub fn durable_count(&self) -> usize {
         self.durable().len()
+    }
+
+    /// **Fetch many manifests at once, coalescing the object-storage GETs** — the manifest twin of
+    /// [`TieredCas::get_batch`](crate::TieredCas::get_batch).
+    ///
+    /// A cold wake resolves the overlay chain by *pointer-chasing* — head → overlay-base → base, each
+    /// id inside the previous — which is inescapably serial and un-batchable. But once a wake's chain
+    /// has been *learned* (the warm set), its ids are all known up front, so they can be fetched in one
+    /// concurrent, deduped batch — collapsing the pointer-chase into a single round-trip. That is the
+    /// only context in which batching manifests helps, and it is exactly the learned-warm-set wake.
+    ///
+    /// Returns the manifests in the same order as `ids`, each **byte-identical** to what [`get`] would
+    /// return and each **hash-verified** on arrival (a corrupt manifest is a corrupt view of the whole
+    /// database — the worst object in the system). **All-or-nothing**: a failed GET, a missing object,
+    /// or a hash mismatch fails the whole batch; nothing is written to the cache for objects not proven
+    /// good, and no partial set is ever returned as success.
+    ///
+    /// [`get`]: ManifestStore::get
+    pub fn get_batch(&self, ids: &[ManifestId]) -> PagerResult<Vec<Manifest>> {
+        let mut resolved: HashMap<ManifestId, Manifest> = HashMap::new();
+        let mut to_fetch: Vec<ManifestId> = Vec::new();
+        let mut seen: HashSet<ManifestId> = HashSet::new();
+        for &id in ids {
+            if !seen.insert(id) {
+                continue;
+            }
+            match self.local.get(id) {
+                Ok(manifest) => {
+                    resolved.insert(id, manifest);
+                }
+                Err(PagerError::MissingManifest(_)) => to_fetch.push(id),
+                Err(e) => return Err(e),
+            }
+        }
+
+        if !to_fetch.is_empty() {
+            let remote = &self.remote;
+            // Manifests are few (a chain of a handful), so this width is never the binding constraint;
+            // it matches the page path's bound for one obvious knob. See TieredCas::get_batch.
+            let sem = Arc::new(Semaphore::new(16));
+            let fetched: Vec<(ManifestId, Vec<u8>)> = self.block(async {
+                let pending = to_fetch.iter().map(|&id| {
+                    let sem = Arc::clone(&sem);
+                    let key = remote.manifest_key(id);
+                    async move {
+                        let _permit = sem.acquire_owned().await.ok();
+                        match remote.get(&key).await {
+                            Ok(Some(bytes)) => Ok((id, bytes)),
+                            Ok(None) => Err(PagerError::MissingManifest(id.to_hex())),
+                            Err(e) => Err(PagerError::backend(e)),
+                        }
+                    }
+                });
+                futures::future::try_join_all(pending).await
+            })?;
+
+            // Verify EVERY manifest before filling ANY — a corrupt one fails the whole batch with the
+            // cache untouched, so a partial fill can never be mistaken for a complete one.
+            let mut verified: Vec<(ManifestId, Manifest)> = Vec::with_capacity(fetched.len());
+            for (id, bytes) in fetched {
+                let manifest = Manifest::decode(&bytes)?;
+                if manifest.id()? != id {
+                    return Err(PagerError::MissingManifest(format!(
+                        "{} (bytes fetched from object storage hash to something else)",
+                        id.to_hex()
+                    )));
+                }
+                verified.push((id, manifest));
+            }
+            for (id, manifest) in verified {
+                self.local.put(&manifest)?;
+                self.durable().insert(id);
+                resolved.insert(id, manifest);
+            }
+        }
+
+        let mut out = Vec::with_capacity(ids.len());
+        for &id in ids {
+            match resolved.get(&id) {
+                Some(manifest) => out.push(manifest.clone()),
+                None => return Err(PagerError::MissingManifest(id.to_hex())),
+            }
+        }
+        Ok(out)
     }
 }
 
