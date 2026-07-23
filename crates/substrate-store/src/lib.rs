@@ -52,11 +52,13 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 mod error;
+mod hotset;
 mod manifests;
 mod remote;
 pub mod tier;
 
 pub use error::{Result, StoreError};
+pub use hotset::{HotSet, HotSetSnapshot};
 pub use manifests::TieredManifestStore;
 pub use remote::RemoteTier;
 pub use tier::{TierStats, TieredCas};
@@ -85,6 +87,13 @@ pub struct WakeToken {
     pub manifest: ManifestId,
     /// The page size the store was created with.
     pub page_size: usize,
+    /// The **warm set** the last active session faulted — the objects the next wake will most likely
+    /// need. `wake()` speculatively prefetches these in one concurrent batch, collapsing the serial
+    /// manifest-chain walk into a single round-trip on a hit. A **hint only**: content-addressing means
+    /// a stale entry can never serve a wrong byte, so applying it needs no validation. `#[serde(default)]`
+    /// keeps tokens written before this field readable — they simply wake without the head start.
+    #[serde(default)]
+    pub hot_set: HotSetSnapshot,
 }
 
 impl WakeToken {
@@ -107,6 +116,11 @@ impl WakeToken {
     }
 }
 
+/// How many objects of each kind the warm-set recorder holds — a working-set bound. A wake that faults
+/// its way past this is a scan, not a point wake, and its warm set is a (still-useful) prefix. 512
+/// pages + 512 manifests is far above any point-query wake and far below "the whole database".
+const HOT_SET_CAP: usize = 512;
+
 /// A page store whose durable home is object storage, and whose local disk is only a cache.
 pub struct TieredStore {
     pager: Arc<Pager>,
@@ -115,6 +129,9 @@ pub struct TieredStore {
     remote: RemoteTier,
     root: PathBuf,
     config: StoreConfig,
+    /// The warm set this store is learning: every object it faults from the remote is recorded here, and
+    /// [`sleep`](Self::sleep) snapshots it into the wake token so the next wake can prefetch it.
+    hot_set: Arc<HotSet>,
 }
 
 impl TieredStore {
@@ -129,18 +146,31 @@ impl TieredStore {
         let root = root.as_ref().to_path_buf();
         let vfs = std_vfs();
 
+        // One warm set, shared by both tiers, so a wake's manifest faults and page faults land in the
+        // same learned set the next wake prefetches.
+        let hot_set = Arc::new(HotSet::new(HOT_SET_CAP));
+
         let local: Arc<dyn Cas> = Arc::new(FsCas::open_with_vfs(
             Arc::clone(&vfs),
             &root,
             config.hasher.clone(),
         )?);
-        let cas = TieredCas::new(local, remote.clone(), config.hasher.clone())?;
+        let cas = TieredCas::with_hot_set(
+            local,
+            remote.clone(),
+            config.hasher.clone(),
+            Some(Arc::clone(&hot_set)),
+        )?;
         tokio::spawn(Arc::clone(&cas).upload_loop());
 
         // Manifests tier too, and they MUST — an overlay manifest is unreadable without its base,
         // and P4 made overlays the normal case. See `manifests.rs`.
         let local_manifests = manifests::local_manifests(vfs, &root)?;
-        let manifests = TieredManifestStore::new(local_manifests, remote.clone())?;
+        let manifests = TieredManifestStore::with_hot_set(
+            local_manifests,
+            remote.clone(),
+            Some(Arc::clone(&hot_set)),
+        )?;
 
         let pager = Arc::new(Pager::from_parts(
             Arc::clone(&cas) as Arc<dyn Cas>,
@@ -155,6 +185,7 @@ impl TieredStore {
             remote,
             root,
             config,
+            hot_set,
         })
     }
 
@@ -221,6 +252,9 @@ impl TieredStore {
             pool: self.remote.pool().to_string(),
             manifest: head,
             page_size: self.config.page_size,
+            // Snapshot what this session faulted, so the next wake can prefetch it. A hint; nothing
+            // depends on it for correctness.
+            hot_set: self.hot_set.snapshot(),
         })
     }
 

@@ -40,6 +40,7 @@
 //! production.
 
 use crate::error::{Result, StoreError};
+use crate::hotset::HotSet;
 use crate::remote::RemoteTier;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -104,6 +105,10 @@ pub struct TieredCas {
     stats: Mutex<TierStats>,
     /// Woken whenever there is something to upload.
     work: Arc<Notify>,
+    /// The warm-set recorder, if this store is learning one. `None` means don't record (the default,
+    /// and every existing caller). A page faulted from the remote is recorded here so the next wake can
+    /// prefetch it.
+    hot_set: Option<Arc<HotSet>>,
 }
 
 impl TieredCas {
@@ -111,6 +116,18 @@ impl TieredCas {
     ///
     /// Must be called from within a **multi-threaded** tokio runtime, or with a handle to one.
     pub fn new(local: Arc<dyn Cas>, remote: RemoteTier, hasher: PageHasher) -> Result<Arc<Self>> {
+        Self::with_hot_set(local, remote, hasher, None)
+    }
+
+    /// As [`new`](Self::new), but recording every faulted page into `hot_set` (the warm set). This is
+    /// how a [`TieredStore`](crate::TieredStore) learns which objects a wake needs. Additive; `new`
+    /// delegates here with `None`, so existing callers record nothing.
+    pub fn with_hot_set(
+        local: Arc<dyn Cas>,
+        remote: RemoteTier,
+        hasher: PageHasher,
+        hot_set: Option<Arc<HotSet>>,
+    ) -> Result<Arc<Self>> {
         let handle = Handle::try_current().map_err(|_| StoreError::NoRuntime)?;
         Ok(Arc::new(TieredCas {
             local,
@@ -120,7 +137,15 @@ impl TieredCas {
             state: Mutex::new(TierState::default()),
             stats: Mutex::new(TierStats::default()),
             work: Arc::new(Notify::new()),
+            hot_set,
         }))
+    }
+
+    /// Record a faulted page in the warm set, if one is attached.
+    fn record_fault(&self, id: PageId) {
+        if let Some(hs) = &self.hot_set {
+            hs.record_page(id);
+        }
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, TierState> {
@@ -231,6 +256,7 @@ impl TieredCas {
                     state.pending.remove(&id);
                 }
                 self.touch(id, page.len() as u64);
+                self.record_fault(id);
                 resolved.insert(id, page);
             }
         }
@@ -458,6 +484,7 @@ impl Cas for TieredCas {
             state.pending.remove(&id);
         }
         self.touch(id, page.len() as u64);
+        self.record_fault(id);
 
         Ok(page)
     }

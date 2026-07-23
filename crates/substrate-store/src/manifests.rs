@@ -24,6 +24,7 @@
 //! behind it — arrives on demand. That is what keeps waking a 100 GB database from moving 100 GB.
 
 use crate::error::{Result, StoreError};
+use crate::hotset::HotSet;
 use crate::remote::RemoteTier;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -44,18 +45,38 @@ pub struct TieredManifestStore {
     handle: Handle,
     /// Manifests confirmed present in object storage.
     durable: Mutex<HashSet<ManifestId>>,
+    /// The warm-set recorder, if this store is learning one — see [`TieredCas`](crate::TieredCas).
+    hot_set: Option<Arc<HotSet>>,
 }
 
 impl TieredManifestStore {
     /// Wrap a local manifest store with an object-storage tier.
     pub fn new(local: Arc<dyn ManifestStore>, remote: RemoteTier) -> Result<Arc<Self>> {
+        Self::with_hot_set(local, remote, None)
+    }
+
+    /// As [`new`](Self::new), but recording every faulted manifest into `hot_set`. Additive; `new`
+    /// delegates here with `None`.
+    pub fn with_hot_set(
+        local: Arc<dyn ManifestStore>,
+        remote: RemoteTier,
+        hot_set: Option<Arc<HotSet>>,
+    ) -> Result<Arc<Self>> {
         let handle = Handle::try_current().map_err(|_| StoreError::NoRuntime)?;
         Ok(Arc::new(TieredManifestStore {
             local,
             remote,
             handle,
             durable: Mutex::new(HashSet::new()),
+            hot_set,
         }))
+    }
+
+    /// Record a faulted manifest in the warm set, if one is attached.
+    fn record_fault(&self, id: ManifestId) {
+        if let Some(hs) = &self.hot_set {
+            hs.record_manifest(id);
+        }
     }
 
     fn durable(&self) -> std::sync::MutexGuard<'_, HashSet<ManifestId>> {
@@ -182,6 +203,7 @@ impl TieredManifestStore {
             for (id, manifest) in verified {
                 self.local.put(&manifest)?;
                 self.durable().insert(id);
+                self.record_fault(id);
                 resolved.insert(id, manifest);
             }
         }
@@ -232,6 +254,7 @@ impl ManifestStore for TieredManifestStore {
         // Fill the local cache. It came *from* object storage, so it is durable there by definition.
         self.local.put(&manifest)?;
         self.durable().insert(id);
+        self.record_fault(id);
         Ok(manifest)
     }
 
