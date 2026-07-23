@@ -282,6 +282,43 @@ impl TieredStore {
         });
     }
 
+    /// **Hydrate a warm set and BLOCK until it is resident** — the awaited twin of [`prefetch`](Self::prefetch).
+    ///
+    /// `prefetch` returns immediately and lets the warm set land *while* the caller reads. That overlap
+    /// is the right shape when a read may or may not arrive, but it has a floor: on a high-latency link
+    /// the first read starts walking the overlay chain before the detached batch has landed, so it races
+    /// the prefetch (~2 round-trips) instead of hitting a warm cache (~1). When the caller *knows* a read
+    /// is imminent — a tenant re-wake whose whole point is to serve the next query fast — it is better to
+    /// pay the one concurrent round-trip up front and then read entirely warm.
+    ///
+    /// So this fetches the manifest chain and the pages **concurrently** (one on a dedicated thread) and
+    /// **joins both before returning**. When it returns, the objects the last session faulted are in the
+    /// local cache, and the read that follows resolves the chain and its pages with no remote GET.
+    ///
+    /// Best-effort per object (via [`warm_all`](TieredCas::warm_all)): a stale or GC'd id is skipped and
+    /// everything else still lands, so a partially-stale warm set degrades to "the read faults the few
+    /// missing objects", never a hard failure. Content-addressing makes every warmed object either the
+    /// right hash-verified bytes or absent, never wrong — so, like `prefetch`, hydration needs no
+    /// validation step. Panics from a runtime-shutdown race are contained (each side is caught), so a
+    /// hydrate can never take the caller's wake down with it.
+    pub fn hydrate(&self, snapshot: &HotSetSnapshot) {
+        if snapshot.is_empty() {
+            return;
+        }
+        let manifests = Arc::clone(&self.manifests);
+        let chain = snapshot.manifests.clone();
+        // The manifest chain warms on a dedicated thread while the pages warm on this one — one
+        // concurrent round-trip for both — then we join, so the caller returns only once it is all warm.
+        let m = std::thread::spawn(move || {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                manifests.warm_all(&chain)
+            }));
+        });
+        let pages = &snapshot.pages;
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.cas.warm_all(pages)));
+        let _ = m.join();
+    }
+
     /// **Sleep.** Make everything durable remotely, drop local state, hand back the pointer.
     ///
     /// The order is the same discipline as the commit protocol: *make it durable elsewhere, verify,

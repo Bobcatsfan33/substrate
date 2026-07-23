@@ -317,6 +317,43 @@ impl TieredCas {
         Ok(out)
     }
 
+    /// **Best-effort warm** — fetch these objects concurrently into the local cache and **block until
+    /// the wave lands**, ignoring any that fail.
+    ///
+    /// Unlike [`get_batch`](Self::get_batch) this is **not all-or-nothing**: it is a *hydration*, not a
+    /// read that owes the caller bytes. A stale or GC'd id warms nothing for itself and every other
+    /// object still lands, so a partially-stale warm set never cliffs the next read to a cold walk — and
+    /// because it is content-addressed, a warmed object is either the right bytes (hash-verified in
+    /// `fault_under_gate`) or absent, never wrong. Each object goes through the same fault gate as a
+    /// read, so a concurrent reader of the same object coordinates and never double-fetches it.
+    ///
+    /// This is the awaited half of the warm set: [`TieredStore::hydrate`](crate::TieredStore::hydrate)
+    /// calls it so the objects are resident *before* the first read runs, instead of the read racing a
+    /// detached prefetch — the difference between the read hitting a warm cache (~1 round-trip) and the
+    /// read walking the chain as the prefetch fills behind it (~2).
+    pub fn warm_all(&self, ids: &[PageId]) {
+        let mut seen = HashSet::new();
+        let ids: Vec<PageId> = ids.iter().copied().filter(|id| seen.insert(*id)).collect();
+        if ids.is_empty() {
+            return;
+        }
+        let sem = Arc::new(Semaphore::new(BATCH_FETCH_WIDTH));
+        self.block(async {
+            let pending = ids.iter().map(|&id| {
+                let sem = Arc::clone(&sem);
+                async move {
+                    // A closed semaphore cannot happen (we own it); a failed acquire proceeds unbounded
+                    // rather than panicking (rule 6). `fault_under_gate` double-checks the local cache, so
+                    // an already-resident object returns immediately without a remote GET.
+                    let _permit = sem.acquire_owned().await.ok();
+                    // Best-effort: a stale/GC'd object is ignored — the read faults it if it needs it.
+                    let _ = self.fault_under_gate(id).await;
+                }
+            });
+            futures::future::join_all(pending).await;
+        });
+    }
+
     /// Enter the runtime from synchronous code.
     ///
     /// See the module docs. Inside a runtime we must hand the thread back with `block_in_place`

@@ -250,6 +250,32 @@ impl TieredManifestStore {
         }
         Ok(out)
     }
+
+    /// **Best-effort warm** — the manifest twin of [`TieredCas::warm_all`](crate::TieredCas::warm_all).
+    /// Fetch this manifest chain concurrently into the local cache and block until it lands, ignoring
+    /// any id that fails. Not all-or-nothing: a stale hint warms nothing for itself and the rest still
+    /// land, so a partially-stale warm set never cliffs the next read. Awaited by
+    /// [`TieredStore::hydrate`](crate::TieredStore::hydrate) so the overlay chain is resident before the
+    /// first read resolves through it, collapsing the serial pointer-chase into one round-trip.
+    pub fn warm_all(&self, ids: &[ManifestId]) {
+        let mut seen = HashSet::new();
+        let ids: Vec<ManifestId> = ids.iter().copied().filter(|id| seen.insert(*id)).collect();
+        if ids.is_empty() {
+            return;
+        }
+        let sem = Arc::new(Semaphore::new(16));
+        self.block(async {
+            let pending = ids.iter().map(|&id| {
+                let sem = Arc::clone(&sem);
+                async move {
+                    let _permit = sem.acquire_owned().await.ok();
+                    // Best-effort: a stale/GC'd manifest is ignored — the read faults it if it needs it.
+                    let _ = self.fault_under_gate(id).await;
+                }
+            });
+            futures::future::join_all(pending).await;
+        });
+    }
 }
 
 impl ManifestStore for TieredManifestStore {

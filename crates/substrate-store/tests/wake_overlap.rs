@@ -232,6 +232,50 @@ async fn learn_hot_token(
     })
 }
 
+/// **`hydrate` makes the next read warm — the structural claim behind the awaited path.**
+///
+/// The wide-area measurement showed the *detached* prefetch flooring at ~2 round-trips: on a high-latency
+/// link the first read starts before the prefetch lands and races it. `hydrate` fixes that by fetching
+/// the warm set and BLOCKING until it is resident, so the read that follows does **zero** remote GETs.
+/// This proves exactly that, deterministically: after `hydrate` returns, reading the whole working set
+/// touches the remote not at all. Contrast `warm_set_overlaps_the_read_even_under_worker_pressure`, where
+/// the detached prefetch can leave the immediate read racing.
+#[tokio::test(flavor = "multi_thread")]
+async fn hydrate_makes_the_next_read_warm() {
+    let backend = Arc::new(InMemory::new());
+    let delay = DelayStore::new(backend);
+    let remote = RemoteTier::new(Arc::clone(&delay) as Arc<dyn ObjectStore>, "hydrate");
+
+    let (cold, _keep) = build_cold_token(&remote).await.expect("cold token");
+    let hot = learn_hot_token(&remote, &cold, BASE_PAGES)
+        .await
+        .expect("hot token");
+
+    // Wake from the COLD token (empty warm set → wake's own prefetch is a no-op), so the head is set but
+    // nothing below it is resident. Then hydrate the learned warm set explicitly and await it.
+    let home = tempfile::tempdir().expect("tempdir");
+    let tiered = TieredStore::wake(home.path(), remote.clone(), &cold)
+        .await
+        .expect("cold wake");
+
+    delay.take_gets();
+    tiered.hydrate(&hot.hot_set);
+    let hydrate_gets = delay.take_gets();
+    assert!(
+        hydrate_gets > 0,
+        "hydrate fetched nothing — the warm set did not reach the remote"
+    );
+
+    // Every working-set page now reads WARM: the overlay chain and the pages are all resident, so the
+    // read walks head (local) → chain (warm) → page (warm) with no remote GET at all.
+    let (_elapsed, read_gets) = time_working_set(Arc::new(tiered), &delay);
+    assert_eq!(
+        read_gets, 0,
+        "a read after hydrate did {read_gets} remote GETs — hydration did not make it warm, so the read \
+         raced instead of hitting the cache (the exact 2-RTT floor hydrate exists to remove)"
+    );
+}
+
 /// Spin up `2×` the worker count of CPU-bound tasks that hog the runtime for as long as the guard is
 /// held. This is the "busy runtime": if the prefetch scheduled on these workers, it would stall behind
 /// them. It yields once per short burst so the runtime stays responsive rather than wedging — real
