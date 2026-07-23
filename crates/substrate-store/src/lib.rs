@@ -134,6 +134,24 @@ pub struct TieredStore {
     hot_set: Arc<HotSet>,
 }
 
+/// Run one best-effort speculative prefetch batch, absorbing both its `Result` and any panic.
+///
+/// The wake prefetch drives its GETs with `block_on` on the runtime handle from a detached thread. If
+/// the caller tears the runtime down while a prefetch is still in flight, tokio's timer/reactor calls
+/// panic ("a Tokio 1.x context ... is being shutdown"). That is a shutdown *race*, not a fault in the
+/// fetch, and this work is explicitly best-effort: an unwound prefetch just means the next read faults
+/// normally — no head start, never a wrong byte, because everything it touches is content-addressed and
+/// hash-verified on the way into the cache. So we `catch_unwind` and move on rather than let a detached
+/// background thread surface a shutdown-race panic. This is the one panic-suppression in the crate,
+/// justified because there is nothing to observe after it and nothing it can corrupt.
+fn prefetch<T>(f: impl FnOnce() -> PagerResult<T>) {
+    // AssertUnwindSafe: the captured tiers hold interior-mutable state (mutexes), but on unwind we
+    // observe none of it — the closure is dropped and the prefetch abandoned — so unwind safety holds.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = f();
+    }));
+}
+
 impl TieredStore {
     /// Open a tiered store, spawning the background uploader.
     ///
@@ -217,6 +235,16 @@ impl TieredStore {
     /// Upload everything and wait. After this returns, the local cache holds nothing unique.
     pub async fn flush(&self) -> Result<()> {
         self.cas.flush().await
+    }
+
+    /// The **warm set** this session has learned so far — every object it has faulted from the remote.
+    ///
+    /// [`sleep`](Self::sleep) folds exactly this into the wake token it returns; this accessor exposes
+    /// it independently, for a consumer that wants to persist or inspect the working set without
+    /// putting the database to sleep (or grafting it onto an existing token to pre-warm a wake). A hint
+    /// only — content-addressing means nothing depends on it for correctness.
+    pub fn warm_set(&self) -> HotSetSnapshot {
+        self.hot_set.snapshot()
     }
 
     /// **Sleep.** Make everything durable remotely, drop local state, hand back the pointer.
@@ -318,10 +346,8 @@ impl TieredStore {
             let chain = token.hot_set.manifests.clone();
             std::thread::spawn(move || {
                 // Two threads so the manifest batch and the page batch overlap in ONE round-trip, not two.
-                let m = std::thread::spawn(move || {
-                    let _ = manifests.get_batch(&chain);
-                });
-                let _ = cas.get_batch(&pages);
+                let m = std::thread::spawn(move || prefetch(|| manifests.get_batch(&chain)));
+                prefetch(|| cas.get_batch(&pages));
                 let _ = m.join();
             });
         }
