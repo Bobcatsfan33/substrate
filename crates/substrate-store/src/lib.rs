@@ -144,7 +144,7 @@ pub struct TieredStore {
 /// hash-verified on the way into the cache. So we `catch_unwind` and move on rather than let a detached
 /// background thread surface a shutdown-race panic. This is the one panic-suppression in the crate,
 /// justified because there is nothing to observe after it and nothing it can corrupt.
-fn prefetch<T>(f: impl FnOnce() -> PagerResult<T>) {
+fn best_effort_batch<T>(f: impl FnOnce() -> PagerResult<T>) {
     // AssertUnwindSafe: the captured tiers hold interior-mutable state (mutexes), but on unwind we
     // observe none of it — the closure is dropped and the prefetch abandoned — so unwind safety holds.
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -247,6 +247,41 @@ impl TieredStore {
         self.hot_set.snapshot()
     }
 
+    /// **Speculatively hydrate a warm set** — the lever that collapses the serial manifest-chain
+    /// pointer-chase into one concurrent round-trip. The `snapshot`'s ids are already known, so the whole
+    /// chain and its pages are fetched at once instead of walked one hop at a time.
+    ///
+    /// [`wake`](Self::wake) calls this itself for the token's warm set. It is **public** for consumers
+    /// that manage their own wake rather than going through [`wake`] — LoomDB, whose tenant is *many*
+    /// branch heads rather than one manifest, assembles its refs over an already-open tier and then calls
+    /// this with the warm set its own token carried.
+    ///
+    /// Returns immediately: the fetch runs on a **dedicated thread**, not a runtime worker, so its
+    /// blocking wait cannot consume a worker the caller's reads need — `get_batch` drives its GETs on the
+    /// runtime's workers while this thread only waits, so it genuinely **overlaps** the caller's
+    /// `block_in_place` reads rather than queuing behind them, and races them into the same caches
+    /// coordinated per-object by the fault gates (so neither double-fetches the other's object).
+    ///
+    /// Best-effort and safe by construction: everything is content-addressed, so a stale hint fetches an
+    /// object the read may not need (a wasted GET, never a wrong byte) and the read faults what it
+    /// actually needs normally — no validation step, and no added latency on a miss because the waste is
+    /// concurrent. A whole-batch failure (an object GC'd since sleep) just means no head start.
+    pub fn prefetch(&self, snapshot: &HotSetSnapshot) {
+        if snapshot.is_empty() {
+            return;
+        }
+        let cas = Arc::clone(&self.cas);
+        let manifests = Arc::clone(&self.manifests);
+        let pages = snapshot.pages.clone();
+        let chain = snapshot.manifests.clone();
+        std::thread::spawn(move || {
+            // Two threads so the manifest batch and the page batch overlap in ONE round-trip, not two.
+            let m = std::thread::spawn(move || best_effort_batch(|| manifests.get_batch(&chain)));
+            best_effort_batch(|| cas.get_batch(&pages));
+            let _ = m.join();
+        });
+    }
+
     /// **Sleep.** Make everything durable remotely, drop local state, hand back the pointer.
     ///
     /// The order is the same discipline as the commit protocol: *make it durable elsewhere, verify,
@@ -324,33 +359,8 @@ impl TieredStore {
         store.manifests.put(&manifest)?;
         store.pager.set_head_to(token.manifest)?;
 
-        // Speculatively warm the objects the last session faulted — the learned warm set. This is the
-        // lever that collapses the serial manifest-chain pointer-chase into one concurrent round-trip:
-        // the ids are already known (from the token), so the whole chain and its pages are fetched at
-        // once instead of walked one hop at a time.
-        //
-        // It runs on a DEDICATED thread, not a runtime worker, so its blocking wait cannot consume a
-        // worker the caller's reads need — `get_batch` here drives its GETs on the runtime's workers and
-        // this thread only waits, so it genuinely OVERLAPS the caller's `block_in_place` reads rather
-        // than queuing behind them. It RACES those reads into the same caches, coordinated per-object by
-        // the fault gates, so neither double-fetches the other's object.
-        //
-        // Best-effort, and safe by construction: everything is content-addressed, so a stale hint fetches
-        // an object the read may not need (a wasted GET, never a wrong byte) and the read faults what it
-        // actually needs normally — no validation step, and no added latency on a miss because the waste
-        // is concurrent. A whole-batch failure (an object GC'd since sleep) just means no head start.
-        if !token.hot_set.is_empty() {
-            let cas = Arc::clone(&store.cas);
-            let manifests = Arc::clone(&store.manifests);
-            let pages = token.hot_set.pages.clone();
-            let chain = token.hot_set.manifests.clone();
-            std::thread::spawn(move || {
-                // Two threads so the manifest batch and the page batch overlap in ONE round-trip, not two.
-                let m = std::thread::spawn(move || prefetch(|| manifests.get_batch(&chain)));
-                prefetch(|| cas.get_batch(&pages));
-                let _ = m.join();
-            });
-        }
+        // Speculatively warm the objects the last session faulted — the learned warm set.
+        store.prefetch(&token.hot_set);
 
         Ok(store)
     }
