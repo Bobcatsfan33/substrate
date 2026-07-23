@@ -47,7 +47,15 @@ pub struct TieredManifestStore {
     durable: Mutex<HashSet<ManifestId>>,
     /// The warm-set recorder, if this store is learning one — see [`TieredCas`](crate::TieredCas).
     hot_set: Option<Arc<HotSet>>,
+    /// Per-object fault gates, striped by manifest id — same role as [`TieredCas`](crate::TieredCas)'s:
+    /// a fetcher holds its manifest's gate across the GET + verify + fill, so a concurrent fetch of the
+    /// same manifest (the speculative prefetch racing the read's `fork`) waits and finds it resident
+    /// rather than double-fetching it.
+    fault_gates: Box<[tokio::sync::Mutex<()>]>,
 }
+
+/// Fault-gate stripes for manifests — see `TieredCas::FAULT_STRIPES`.
+const MANIFEST_FAULT_STRIPES: usize = 256;
 
 impl TieredManifestStore {
     /// Wrap a local manifest store with an object-storage tier.
@@ -63,12 +71,16 @@ impl TieredManifestStore {
         hot_set: Option<Arc<HotSet>>,
     ) -> Result<Arc<Self>> {
         let handle = Handle::try_current().map_err(|_| StoreError::NoRuntime)?;
+        let fault_gates = (0..MANIFEST_FAULT_STRIPES)
+            .map(|_| tokio::sync::Mutex::new(()))
+            .collect();
         Ok(Arc::new(TieredManifestStore {
             local,
             remote,
             handle,
             durable: Mutex::new(HashSet::new()),
             hot_set,
+            fault_gates,
         }))
     }
 
@@ -77,6 +89,44 @@ impl TieredManifestStore {
         if let Some(hs) = &self.hot_set {
             hs.record_manifest(id);
         }
+    }
+
+    /// The fault gate for `id`'s stripe.
+    fn fault_gate(&self, id: ManifestId) -> &tokio::sync::Mutex<()> {
+        let b = id.as_bytes();
+        let idx = ((b[0] as usize) << 8 | b[1] as usize) % MANIFEST_FAULT_STRIPES;
+        &self.fault_gates[idx]
+    }
+
+    /// Fetch `id` from the remote under its fault gate, filling the local cache — double-checked, so a
+    /// concurrent fetch of the same manifest does not double-fetch it. Shared by the single `get` and by
+    /// `get_batch`, so both coordinate on the manifest's gate.
+    async fn fault_under_gate(&self, id: ManifestId) -> PagerResult<Manifest> {
+        let _gate = self.fault_gate(id).lock().await;
+
+        // Double-check: someone may have filled it while we waited for the gate.
+        match self.local.get(id) {
+            Ok(manifest) => return Ok(manifest),
+            Err(PagerError::MissingManifest(_)) => {}
+            Err(e) => return Err(e),
+        }
+
+        let key = self.remote.manifest_key(id);
+        let bytes = self.remote.get(&key).await.map_err(PagerError::backend)?;
+        let Some(bytes) = bytes else {
+            return Err(PagerError::MissingManifest(id.to_hex()));
+        };
+        let manifest = Manifest::decode(&bytes)?;
+        if manifest.id()? != id {
+            return Err(PagerError::MissingManifest(format!(
+                "{} (bytes fetched from object storage hash to something else)",
+                id.to_hex()
+            )));
+        }
+        self.local.put(&manifest)?;
+        self.durable().insert(id);
+        self.record_fault(id);
+        Ok(manifest)
     }
 
     fn durable(&self) -> std::sync::MutexGuard<'_, HashSet<ManifestId>> {
@@ -167,43 +217,26 @@ impl TieredManifestStore {
         }
 
         if !to_fetch.is_empty() {
-            let remote = &self.remote;
             // Manifests are few (a chain of a handful), so this width is never the binding constraint;
-            // it matches the page path's bound for one obvious knob. See TieredCas::get_batch.
+            // it matches the page path's bound for one obvious knob. See TieredCas::get_batch. Each fetch
+            // goes through the SAME gated, double-checked, verify-and-fill path the single `get` uses, so
+            // a batch and a concurrent fork of the same manifest coordinate on its gate, never
+            // double-fetching it.
             let sem = Arc::new(Semaphore::new(16));
-            let fetched: Vec<(ManifestId, Vec<u8>)> = self.block(async {
+            let fetched: Vec<(ManifestId, Manifest)> = self.block(async {
                 let pending = to_fetch.iter().map(|&id| {
                     let sem = Arc::clone(&sem);
-                    let key = remote.manifest_key(id);
                     async move {
                         let _permit = sem.acquire_owned().await.ok();
-                        match remote.get(&key).await {
-                            Ok(Some(bytes)) => Ok((id, bytes)),
-                            Ok(None) => Err(PagerError::MissingManifest(id.to_hex())),
-                            Err(e) => Err(PagerError::backend(e)),
-                        }
+                        self.fault_under_gate(id)
+                            .await
+                            .map(|manifest| (id, manifest))
                     }
                 });
                 futures::future::try_join_all(pending).await
             })?;
 
-            // Verify EVERY manifest before filling ANY — a corrupt one fails the whole batch with the
-            // cache untouched, so a partial fill can never be mistaken for a complete one.
-            let mut verified: Vec<(ManifestId, Manifest)> = Vec::with_capacity(fetched.len());
-            for (id, bytes) in fetched {
-                let manifest = Manifest::decode(&bytes)?;
-                if manifest.id()? != id {
-                    return Err(PagerError::MissingManifest(format!(
-                        "{} (bytes fetched from object storage hash to something else)",
-                        id.to_hex()
-                    )));
-                }
-                verified.push((id, manifest));
-            }
-            for (id, manifest) in verified {
-                self.local.put(&manifest)?;
-                self.durable().insert(id);
-                self.record_fault(id);
+            for (id, manifest) in fetched {
                 resolved.insert(id, manifest);
             }
         }
@@ -225,37 +258,15 @@ impl ManifestStore for TieredManifestStore {
     }
 
     fn get(&self, id: ManifestId) -> PagerResult<Manifest> {
+        // Fast path: a local hit needs no gate.
         match self.local.get(id) {
             Ok(manifest) => return Ok(manifest),
             Err(PagerError::MissingManifest(_)) => {} // fall through to the remote tier
             Err(e) => return Err(e),
         }
-
-        let key = self.remote.manifest_key(id);
-        let bytes = self
-            .block(async { self.remote.get(&key).await })
-            .map_err(PagerError::backend)?;
-
-        let Some(bytes) = bytes else {
-            return Err(PagerError::MissingManifest(id.to_hex()));
-        };
-
-        // Verify on arrival. A manifest is content-addressed, so a corrupted download cannot
-        // masquerade as the real one — and a corrupt manifest is a corrupt view of the *entire*
-        // database, which is the worst object in this system.
-        let manifest = Manifest::decode(&bytes)?;
-        if manifest.id()? != id {
-            return Err(PagerError::MissingManifest(format!(
-                "{} (bytes fetched from object storage hash to something else)",
-                id.to_hex()
-            )));
-        }
-
-        // Fill the local cache. It came *from* object storage, so it is durable there by definition.
-        self.local.put(&manifest)?;
-        self.durable().insert(id);
-        self.record_fault(id);
-        Ok(manifest)
+        // Miss: fault under the per-object gate (double-checked), so a concurrent fetch of the same
+        // manifest — the speculative prefetch racing this read's fork — does not double-fetch it.
+        self.block(async { self.fault_under_gate(id).await })
     }
 
     fn contains(&self, id: ManifestId) -> PagerResult<bool> {

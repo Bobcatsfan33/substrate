@@ -109,7 +109,18 @@ pub struct TieredCas {
     /// and every existing caller). A page faulted from the remote is recorded here so the next wake can
     /// prefetch it.
     hot_set: Option<Arc<HotSet>>,
+    /// Per-object fault gates, striped by page id. A fetcher holds its object's gate across the remote
+    /// GET + verify + fill, so a concurrent fetch of the **same** object — a second reader, or the
+    /// speculative prefetch racing a read — waits and finds it resident rather than issuing a redundant
+    /// GET. Distinct objects hash to distinct stripes and never wait on each other. Async (`tokio`)
+    /// because both the synchronous [`Cas::get`] (via `block`) and the concurrent [`get_batch`] acquire
+    /// it, and a std mutex held across an `.await` would block a worker.
+    fault_gates: Box<[tokio::sync::Mutex<()>]>,
 }
+
+/// How many fault-gate stripes. Bounds same-object serialization to ~1/N false sharing across distinct
+/// objects; comfortably above any realistic concurrent-fault fan-in.
+const FAULT_STRIPES: usize = 256;
 
 impl TieredCas {
     /// Wrap a local CAS with an object-storage tier.
@@ -129,6 +140,9 @@ impl TieredCas {
         hot_set: Option<Arc<HotSet>>,
     ) -> Result<Arc<Self>> {
         let handle = Handle::try_current().map_err(|_| StoreError::NoRuntime)?;
+        let fault_gates = (0..FAULT_STRIPES)
+            .map(|_| tokio::sync::Mutex::new(()))
+            .collect();
         Ok(Arc::new(TieredCas {
             local,
             remote,
@@ -138,6 +152,7 @@ impl TieredCas {
             stats: Mutex::new(TierStats::default()),
             work: Arc::new(Notify::new()),
             hot_set,
+            fault_gates,
         }))
     }
 
@@ -146,6 +161,59 @@ impl TieredCas {
         if let Some(hs) = &self.hot_set {
             hs.record_page(id);
         }
+    }
+
+    /// The fault gate for `id`'s stripe.
+    fn fault_gate(&self, id: PageId) -> &tokio::sync::Mutex<()> {
+        // First bytes of the content hash are already uniformly distributed; no extra mixing needed.
+        let b = id.as_bytes();
+        let idx = ((b[0] as usize) << 8 | b[1] as usize) % FAULT_STRIPES;
+        &self.fault_gates[idx]
+    }
+
+    /// Fetch `id` from the remote under its fault gate, filling the local cache. The caller has already
+    /// seen a local miss; by the time the gate is ours another fetcher may have filled it (double-checked
+    /// locking), so we recheck and use the resident copy rather than issue a redundant GET. This is the
+    /// single place a page crosses the network, shared by [`Cas::get`] and [`get_batch`], so both
+    /// coordinate and never double-fetch the same object.
+    async fn fault_under_gate(&self, id: PageId) -> PagerResult<Page> {
+        let _gate = self.fault_gate(id).lock().await;
+
+        // Double-check: someone may have filled it while we waited for the gate.
+        match self.local.get(id) {
+            Ok(page) => {
+                self.touch(id, page.len() as u64);
+                self.stats_mut().hits += 1;
+                return Ok(page);
+            }
+            Err(PagerError::MissingPage(_)) => {}
+            Err(e) => return Err(e),
+        }
+
+        self.stats_mut().misses += 1;
+        let key = self.remote.page_key(id);
+        let bytes = self.remote.get(&key).await.map_err(PagerError::backend)?;
+        let Some(bytes) = bytes else {
+            return Err(PagerError::MissingPage(id));
+        };
+        // Verify on arrival — content addressing means a corrupted download cannot masquerade as the page.
+        let page = Page::new(&self.hasher, bytes, usize::MAX)?;
+        if page.id() != id {
+            return Err(PagerError::CorruptPage {
+                expected: id,
+                actual: page.id(),
+                len: page.len(),
+            });
+        }
+        self.local.put(&page)?;
+        {
+            let mut state = self.state();
+            state.durable.insert(id);
+            state.pending.remove(&id);
+        }
+        self.touch(id, page.len() as u64);
+        self.record_fault(id);
+        Ok(page)
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, TierState> {
@@ -208,55 +276,31 @@ impl TieredCas {
             }
         }
 
-        // 2. Fetch the distinct missing objects concurrently, bounded width, over the pooled client.
+        // 2. Fetch the distinct missing objects concurrently, bounded width, over the pooled client —
+        //    each through the SAME gated, double-checked, verify-and-fill path the single-page read uses
+        //    (`fault_under_gate`). So a batch fetch and a concurrent read of the same object coordinate
+        //    on that object's gate and never double-fetch it, and every page is hash-verified under its
+        //    gate before it fills the cache.
         if !to_fetch.is_empty() {
-            self.stats_mut().misses += to_fetch.len() as u64;
-            let remote = &self.remote;
             let sem = Arc::new(Semaphore::new(BATCH_FETCH_WIDTH));
-            let fetched: Vec<(PageId, Vec<u8>)> = self.block(async {
+            let fetched: Vec<(PageId, Page)> = self.block(async {
                 let pending = to_fetch.iter().map(|&id| {
                     let sem = Arc::clone(&sem);
-                    let key = remote.page_key(id);
                     async move {
                         // Bound concurrency. A closed semaphore cannot happen here (we own it), so a
                         // failed acquire proceeds unbounded rather than panicking (rule 6).
                         let _permit = sem.acquire_owned().await.ok();
-                        match remote.get(&key).await {
-                            Ok(Some(bytes)) => Ok((id, bytes)),
-                            // Neither tier has it — same meaning as the single-page path's `None`.
-                            Ok(None) => Err(PagerError::MissingPage(id)),
-                            Err(e) => Err(PagerError::backend(e)),
-                        }
+                        self.fault_under_gate(id).await.map(|page| (id, page))
                     }
                 });
-                // Short-circuits on the first error and drops the rest, so a failed or missing object
-                // aborts the batch before anything is written to the cache.
+                // try_join_all short-circuits on the first error and drops the rest, so a failed or
+                // missing object aborts the batch — no partial set is returned as success. (Objects that
+                // resolved before the error are correct, hash-verified pages already in the cache: a
+                // benign warm, never wrong bytes.)
                 futures::future::try_join_all(pending).await
             })?;
 
-            // 3. Verify EVERY object before filling ANY — a corrupt page fails the whole batch with the
-            //    cache untouched, so a partial fill can never be mistaken for a complete one.
-            let mut verified: Vec<(PageId, Page)> = Vec::with_capacity(fetched.len());
-            for (id, bytes) in fetched {
-                let page = Page::new(&self.hasher, bytes, usize::MAX)?;
-                if page.id() != id {
-                    return Err(PagerError::CorruptPage {
-                        expected: id,
-                        actual: page.id(),
-                        len: page.len(),
-                    });
-                }
-                verified.push((id, page));
-            }
-            for (id, page) in verified {
-                self.local.put(&page)?;
-                {
-                    let mut state = self.state();
-                    state.durable.insert(id);
-                    state.pending.remove(&id);
-                }
-                self.touch(id, page.len() as u64);
-                self.record_fault(id);
+            for (id, page) in fetched {
                 resolved.insert(id, page);
             }
         }
@@ -439,6 +483,7 @@ impl Cas for TieredCas {
     }
 
     fn get(&self, id: PageId) -> PagerResult<Page> {
+        // Fast path: a local hit needs no gate.
         match self.local.get(id) {
             Ok(page) => {
                 self.touch(id, page.len() as u64);
@@ -448,45 +493,10 @@ impl Cas for TieredCas {
             Err(PagerError::MissingPage(_)) => {} // fall through to the remote tier
             Err(e) => return Err(e),
         }
-
-        self.stats_mut().misses += 1;
-
-        // Cache miss. Block on the fetch — see the module docs for why this is the right trade.
-        let key = self.remote.page_key(id);
-        let bytes = self
-            .block(async { self.remote.get(&key).await })
-            .map_err(PagerError::backend)?;
-
-        let Some(bytes) = bytes else {
-            // Neither tier has it. Eviction refuses to touch a non-durable page, so this is not
-            // reachable through any code path we control — which means if it happens, something
-            // outside us deleted it, and saying so is more useful than a generic not-found.
-            return Err(PagerError::MissingPage(id));
-        };
-
-        // Verify on arrival. Bytes that crossed a network are exactly the bytes we want to
-        // re-hash: content addressing means a corrupted download cannot masquerade as the page.
-        let page = Page::new(&self.hasher, bytes, usize::MAX)?;
-        if page.id() != id {
-            return Err(PagerError::CorruptPage {
-                expected: id,
-                actual: page.id(),
-                len: page.len(),
-            });
-        }
-
-        // Fill the local cache. It came *from* object storage, so it is durable there by
-        // definition — mark it evictable immediately.
-        self.local.put(&page)?;
-        {
-            let mut state = self.state();
-            state.durable.insert(id);
-            state.pending.remove(&id);
-        }
-        self.touch(id, page.len() as u64);
-        self.record_fault(id);
-
-        Ok(page)
+        // Miss: fault under the per-object gate, so a concurrent fetch of the same object (a second
+        // reader, or the speculative prefetch) does not double-fetch it. Block on it — see the module
+        // docs for why this is the right trade.
+        self.block(async { self.fault_under_gate(id).await })
     }
 
     fn contains(&self, id: PageId) -> PagerResult<bool> {
