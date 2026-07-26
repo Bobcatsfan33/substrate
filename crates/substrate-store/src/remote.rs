@@ -52,6 +52,15 @@ impl RemoteTier {
         &self.pool
     }
 
+    /// **Start a warm keep-alive pool** on this tier's object-store client — the transport half of the
+    /// ~1 RTT wake ([`WarmPool`](crate::WarmPool)). Holds `config.min_idle` connections open so a bursty
+    /// wake after an idle gap finds warm connections and pays no fresh-handshake round-trip. Call once on
+    /// the long-lived client (server startup); drop the returned handle to stop it. Additive — an
+    /// existing deployment that never calls this keeps exactly today's behaviour.
+    pub fn spawn_warm_pool(&self, config: crate::WarmPoolConfig) -> crate::WarmPool {
+        crate::WarmPool::spawn(Arc::clone(&self.backend), &self.pool, config)
+    }
+
     /// The key a page lives at.
     ///
     /// Sharded two levels, exactly like the local CAS — object stores do not have directories, but

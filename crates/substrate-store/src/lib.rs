@@ -56,12 +56,14 @@ mod hotset;
 mod manifests;
 mod remote;
 pub mod tier;
+mod warmpool;
 
 pub use error::{Result, StoreError};
 pub use hotset::{HotSet, HotSetSnapshot};
 pub use manifests::TieredManifestStore;
 pub use remote::RemoteTier;
 pub use tier::{TierStats, TieredCas};
+pub use warmpool::{WarmPool, WarmPoolConfig};
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
