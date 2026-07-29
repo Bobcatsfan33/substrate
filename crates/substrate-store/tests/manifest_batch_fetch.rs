@@ -9,7 +9,7 @@
 //! all), seeded straight into a remote, then fetched by a cold `TieredManifestStore`.
 
 use object_store::memory::InMemory;
-use object_store::ObjectStore;
+use object_store::ObjectStoreExt;
 use std::sync::Arc;
 use substrate_pager::{
     Manifest, ManifestId, ManifestStore, MemCas, MemManifestStore, PageHasher, PageStore, Pager,

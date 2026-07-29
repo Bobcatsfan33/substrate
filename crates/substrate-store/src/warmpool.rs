@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use object_store::path::Path as ObjPath;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use tokio::task::JoinHandle;
 
 /// How to keep the pool warm.

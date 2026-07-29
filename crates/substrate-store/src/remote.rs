@@ -24,7 +24,7 @@
 
 use crate::error::{Result, StoreError};
 use bytes::Bytes;
-use object_store::{path::Path as ObjPath, ObjectStore};
+use object_store::{path::Path as ObjPath, ObjectStore, ObjectStoreExt};
 use std::sync::Arc;
 use substrate_pager::{ManifestId, PageId};
 

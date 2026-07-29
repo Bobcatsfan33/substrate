@@ -12,7 +12,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.85"
 license = "Apache-2.0"
 repository = "https://github.com/Bobcatsfan33/substrate"
 homepage = "https://github.com/Bobcatsfan33/substrate"
@@ -42,7 +42,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync", 
 # feature (on by default, for compatibility); an air-gap build (`--no-default-features`) compiles no
 # network client at all. The tiering code is backend-agnostic (`Arc<dyn ObjectStore>`), so this is a
 # dependency-feature change with no code change.
-object_store = { version = "0.11", default-features = false }
+object_store = { version = "0.14.1", default-features = false }
 bytes = "1"
 futures = "0.3"
 async-trait = "0.1"
