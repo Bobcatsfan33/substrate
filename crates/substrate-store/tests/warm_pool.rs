@@ -21,8 +21,8 @@ use futures::stream::BoxStream;
 use object_store::memory::InMemory;
 use object_store::path::Path as ObjPath;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts,
-    PutOptions, PutPayload, PutResult, Result as OsResult,
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as OsResult,
 };
 use substrate_store::{WarmPool, WarmPoolConfig};
 
@@ -53,25 +53,23 @@ impl std::fmt::Display for ProbeStore {
     }
 }
 
-type BoxedStream<'a> = BoxStream<'a, OsResult<ObjectMeta>>;
-
 #[async_trait::async_trait]
 impl ObjectStore for ProbeStore {
-    async fn head(&self, location: &ObjPath) -> OsResult<ObjectMeta> {
-        let n = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
-        self.max_inflight.fetch_max(n, Ordering::SeqCst);
-        self.heads.fetch_add(1, Ordering::SeqCst);
-        // Widen the window so overlapping cycles would be caught by `max_inflight`.
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        self.inflight.fetch_sub(1, Ordering::SeqCst);
-        // Always an error — a missing probe key, or a dead connection. The maintainer must not die on it.
-        let _ = self.fail.load(Ordering::SeqCst);
-        Err(object_store::Error::NotFound {
-            path: location.to_string(),
-            source: "keepalive probe".into(),
-        })
-    }
     async fn get_opts(&self, location: &ObjPath, options: GetOptions) -> OsResult<GetResult> {
+        if options.head {
+            let n = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_inflight.fetch_max(n, Ordering::SeqCst);
+            self.heads.fetch_add(1, Ordering::SeqCst);
+            // Widen the window so overlapping cycles would be caught by `max_inflight`.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            self.inflight.fetch_sub(1, Ordering::SeqCst);
+            // Always an error — a missing probe key, or a dead connection. The maintainer must not die on it.
+            let _ = self.fail.load(Ordering::SeqCst);
+            return Err(object_store::Error::NotFound {
+                path: location.to_string(),
+                source: "keepalive probe".into(),
+            });
+        }
         self.inner.get_opts(location, options).await
     }
     async fn put_opts(
@@ -85,24 +83,24 @@ impl ObjectStore for ProbeStore {
     async fn put_multipart_opts(
         &self,
         location: &ObjPath,
-        opts: PutMultipartOpts,
+        opts: PutMultipartOptions,
     ) -> OsResult<Box<dyn MultipartUpload>> {
         self.inner.put_multipart_opts(location, opts).await
     }
-    async fn delete(&self, location: &ObjPath) -> OsResult<()> {
-        self.inner.delete(location).await
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, OsResult<ObjPath>>,
+    ) -> BoxStream<'static, OsResult<ObjPath>> {
+        self.inner.delete_stream(locations)
     }
-    fn list(&self, prefix: Option<&ObjPath>) -> BoxedStream<'_> {
+    fn list(&self, prefix: Option<&ObjPath>) -> BoxStream<'static, OsResult<ObjectMeta>> {
         self.inner.list(prefix)
     }
     async fn list_with_delimiter(&self, prefix: Option<&ObjPath>) -> OsResult<ListResult> {
         self.inner.list_with_delimiter(prefix).await
     }
-    async fn copy(&self, from: &ObjPath, to: &ObjPath) -> OsResult<()> {
-        self.inner.copy(from, to).await
-    }
-    async fn copy_if_not_exists(&self, from: &ObjPath, to: &ObjPath) -> OsResult<()> {
-        self.inner.copy_if_not_exists(from, to).await
+    async fn copy_opts(&self, from: &ObjPath, to: &ObjPath, options: CopyOptions) -> OsResult<()> {
+        self.inner.copy_opts(from, to, options).await
     }
 }
 

@@ -42,8 +42,8 @@ use futures::stream::BoxStream;
 use object_store::memory::InMemory;
 use object_store::path::Path as ObjPath;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts,
-    PutOptions, PutPayload, PutResult, Result as OsResult,
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as OsResult,
 };
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -103,24 +103,24 @@ impl ObjectStore for DelayStore {
     async fn put_multipart_opts(
         &self,
         location: &ObjPath,
-        opts: PutMultipartOpts,
+        opts: PutMultipartOptions,
     ) -> OsResult<Box<dyn MultipartUpload>> {
         self.inner.put_multipart_opts(location, opts).await
     }
-    async fn delete(&self, location: &ObjPath) -> OsResult<()> {
-        self.inner.delete(location).await
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, OsResult<ObjPath>>,
+    ) -> BoxStream<'static, OsResult<ObjPath>> {
+        self.inner.delete_stream(locations)
     }
-    fn list(&self, prefix: Option<&ObjPath>) -> BoxStream<'_, OsResult<ObjectMeta>> {
+    fn list(&self, prefix: Option<&ObjPath>) -> BoxStream<'static, OsResult<ObjectMeta>> {
         self.inner.list(prefix)
     }
     async fn list_with_delimiter(&self, prefix: Option<&ObjPath>) -> OsResult<ListResult> {
         self.inner.list_with_delimiter(prefix).await
     }
-    async fn copy(&self, from: &ObjPath, to: &ObjPath) -> OsResult<()> {
-        self.inner.copy(from, to).await
-    }
-    async fn copy_if_not_exists(&self, from: &ObjPath, to: &ObjPath) -> OsResult<()> {
-        self.inner.copy_if_not_exists(from, to).await
+    async fn copy_opts(&self, from: &ObjPath, to: &ObjPath, options: CopyOptions) -> OsResult<()> {
+        self.inner.copy_opts(from, to, options).await
     }
 }
 

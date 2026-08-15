@@ -363,7 +363,7 @@ async fn a_fork_shares_pages_in_object_storage() -> Result<()> {
 /// A corrupted object in storage is detected on arrival, never served.
 #[tokio::test(flavor = "multi_thread")]
 async fn corruption_in_object_storage_is_caught_on_the_way_in() -> Result<()> {
-    use object_store::ObjectStore;
+    use object_store::ObjectStoreExt;
 
     let backend = Arc::new(InMemory::new());
     let remote = RemoteTier::new(backend.clone(), "acme");
@@ -525,7 +525,7 @@ async fn scrub_finds_rot_and_repair_fixes_it_from_object_storage() -> Result<()>
 /// worse: the customer would then have a database that reads without error and returns wrong bytes.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_page_damaged_in_both_tiers_is_reported_lost_not_quietly_installed() -> Result<()> {
-    use object_store::ObjectStore;
+    use object_store::ObjectStoreExt;
 
     let backend = Arc::new(InMemory::new());
     let remote = RemoteTier::new(backend.clone(), "acme");

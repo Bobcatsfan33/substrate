@@ -12,7 +12,7 @@
 //! complete one, the same rule the single-page path and loom's NodeStore hold.
 
 use object_store::memory::InMemory;
-use object_store::ObjectStore;
+use object_store::ObjectStoreExt;
 use std::sync::Arc;
 use substrate_pager::{Cas, MemCas, Page, PageHasher, PageId, PagerError};
 use substrate_store::{RemoteTier, TieredCas};
